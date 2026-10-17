@@ -276,3 +276,10 @@ class FakeResp {
     boolean hasError() { status >= 400 || status <= 0 || errorMessage != null }
     String getErrorMessage() { errorMessage }
 }
+
+/** Like Hubitat's ResponseHeaders$HeaderEntry: not a String; its text is "Name: value". */
+class FakeHeaderEntry {
+    String name
+    String value
+    String toString() { "${name}: ${value}" }
+}

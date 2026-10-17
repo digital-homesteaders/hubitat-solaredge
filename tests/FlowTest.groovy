@@ -497,4 +497,31 @@ check("cookies: several in one header, Expires dates kept whole") {
     assert app.cookiesOf(new FakeResp(status: 302, headers: [:])) == []
 }
 
+check("cookies: Hubitat's HeaderEntry values (as seen on a hub)") {
+    String id = "JSESSIONID=D8EA5332F48EE29C0CB90D49A560B0E4"
+    FakeHeaderEntry entry = new FakeHeaderEntry(name: "Set-Cookie", value: "${id}; Path=/solaredge-apigw; Secure; HttpOnly")
+    assert app.cookiesOf(new FakeResp(status: 302, headers: ["Set-Cookie": entry])) == [id]
+    assert app.cookiesOf(new FakeResp(status: 302, headers: ["Set-Cookie": [entry, new FakeHeaderEntry(name: "Set-Cookie", value: "B=2")]])) == [id, "B=2"]
+    // An entry whose name/value aren't readable: its text still works.
+    def opaque = new Object() { String toString() { "Set-Cookie: ${id}; Path=/" } }
+    assert app.cookiesOf(new FakeResp(status: 302, headers: ["Set-Cookie": opaque])) == [id]
+    // Headers as a list of entries rather than a map.
+    FakeResp listed = new FakeResp(status: 302)
+    listed.metaClass.getHeaders = { -> [new FakeHeaderEntry(name: "Content-Type", value: "text/html"), entry] }
+    assert app.cookiesOf(listed) == [id]
+}
+
+check("login with a HeaderEntry cookie logs in and the tick goes out") {
+    fresh()
+    FakeHeaderEntry entry = new FakeHeaderEntry(name: "Set-Cookie", value: "JSESSIONID=abc; Path=/solaredge-apigw; Secure; HttpOnly")
+    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 302, data: "", headers: ["Set-Cookie": entry]) : null }
+    app.mainPage()
+    app.devicesPage()
+    serve()
+    assert app.state.status == "Logged in"
+    assert app.state.discovered.size() == 5
+    assert app.RUNTIME[app.app.id].cookies == ["JSESSIONID=abc"]
+    assert app.callsNamed("asynchttpGet").every { it[2].headers.Cookie == "JSESSIONID=abc" }
+}
+
 Check.finish()

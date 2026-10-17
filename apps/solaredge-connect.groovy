@@ -498,6 +498,7 @@ def loginDone(resp, Map data) {
     }
     rt.loginRetryMs = 0L
     rt.loginBlockedUntil = 0L
+    logDebug "Login answered HTTP ${status} with cookies ${cookies.collect { it.split('=')[0] }}"
     rt.cookies = cookies
     rt.cookieGen = ((rt.cookieGen ?: 0) as int) + 1
     state.status = "Logged in"
@@ -510,16 +511,25 @@ def loginDone(resp, Map data) {
 
 private boolean looksLikeLoginForm(String body) { body != null && body.contains("j_password") }
 
-/** name=value of each Set-Cookie header; several may arrive in one header, comma-separated. */
+/**
+ * name=value of each Set-Cookie header. Hubitat hands headers as a map whose
+ * values are HeaderEntry objects ("Set-Cookie: A=1; Path=/"), so headers are
+ * read as text whatever their type; several cookies may also share one header.
+ */
 List cookiesOf(resp) {
     def headers
     try { headers = resp.getHeaders() } catch (e) { headers = null }
     List values = []
-    (headers ?: [:]).each { k, v ->
-        if (k?.toString()?.equalsIgnoreCase("Set-Cookie")) values.addAll(v instanceof Collection ? v : [v])
+    if (headers instanceof Map) {
+        headers.each { k, v ->
+            if (k?.toString()?.equalsIgnoreCase("Set-Cookie")) values.addAll(v instanceof Collection ? v : [v])
+        }
+    } else if (headers != null) {
+        headers.each { h -> if (headerText(h).toLowerCase().startsWith("set-cookie:")) values << h }
     }
     List out = []
-    values.each { String v ->
+    values.each { h ->
+        String v = headerText(h).replaceFirst(/(?i)^set-cookie:\s*/, "")
         // A comma starts a new cookie only when a name= follows (Expires dates hold commas too).
         v.split(/,(?=\s*[A-Za-z0-9_.\-]+=)/).each { String c ->
             String nv = c.split(";")[0].trim()
@@ -527,6 +537,18 @@ List cookiesOf(resp) {
         }
     }
     return out
+}
+
+/** A header as text: a String, or a header object whose text is "Name: value". */
+private String headerText(def h) {
+    if (h == null) return ""
+    if (h instanceof CharSequence) return h.toString()
+    try {
+        def n = h.name
+        def v = h.value
+        if (n != null && v != null) return "${n}: ${v}".toString()
+    } catch (e) { }
+    return h.toString()
 }
 
 private void failWaiting(String msg, boolean outage, int status = 0) {
