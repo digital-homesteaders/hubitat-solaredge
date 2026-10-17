@@ -62,8 +62,10 @@ preferences {
 @Field static final int DEFAULT_POLL = 60
 @Field static final int MIN_POLL = 30
 @Field static final int MAX_POLL = 300
-// A tick still waiting for answers after this long is given up on.
-@Field static final long STALE_TICK_MS = 2 * 20 * 1000L + 30000L
+// A tick still waiting for answers after this long is given up on: longer than the
+// longest legitimate chain (login, request, re-login, retry, inverter follow-up) of
+// REQUEST_TIMEOUT each, plus slack.
+@Field static final long STALE_TICK_MS = 5 * 20 * 1000L + 10000L
 // Every third energy tick (15 minutes) also fetches the slow data.
 @Field static final int SLOW_EVERY = 3
 // After rejected credentials no automatic login for this long, doubling per rejection.
@@ -276,7 +278,7 @@ private Map runtime() {
     Map rt = RUNTIME[app.id]
     if (rt == null) {
         rt = new ConcurrentHashMap([cookies: [], loginBlockedUntil: 0L, loginRetryMs: 0L, backoffUntil: 0L, outages: 0,
-            lastSuccessAt: 0L, waiting: new ConcurrentHashMap(), loggedOnce: new ConcurrentHashMap(), credKey: credentialsKey()])
+            waiting: new ConcurrentHashMap(), loggedOnce: new ConcurrentHashMap(), credKey: credentialsKey()])
         RUNTIME[app.id] = rt
     }
     return rt
@@ -366,7 +368,11 @@ private Map apiGet(String path, Map query = [:]) {
 private void send(Map req) {
     Map rt = runtime()
     if (!rt.cookies) {
-        rt.waiting[req.key] = req
+        // One entry per request, so two callers of the same URL both get their answer;
+        // `seq` keeps them in order (an "on" then "off" must go out in that order).
+        long seq = ((rt.seq ?: 0L) as long) + 1
+        rt.seq = seq
+        rt.waiting[UUID.randomUUID().toString()] = req + [seq: seq]
         startLogin()
         return
     }
@@ -396,18 +402,26 @@ def requestDone(resp, Map data) {
     boolean loggedOut = status == 401 || (status >= 300 && status < 400) || (status == 200 && json == null && looksLikeLogin(body))
     if (loggedOut) {
         // Only this session expired: a login since this request went out stays.
-        if (rt.cookieGen == data.gen) rt.cookies = []
+        boolean sameSession = rt.cookieGen == data.gen && rt.cookies
+        if (sameSession) rt.cookies = []
         if (!data.retried) {
             logDebug "${data.path}: session expired, logging in again"
             req.retried = true
             send(req)
             return
         }
+        // Logged out again right after a fresh login: the login didn't really work
+        // (or its cookies don't). Hold logins back as after a rejection.
+        // Once per session: the other requests of that session fail the same way.
+        if (sameSession) holdLogins("SolarEdge didn't accept the new session (HTTP ${status})")
         deliver(req, [error: "Unauthorized", status: status, outage: false])
         return
     }
-    if (status >= 200 && status < 300 && json != null) {
-        rt.lastSuccessAt = now()
+    // A command may answer 2xx with no JSON body (e.g. 204).
+    if (status >= 200 && status < 300 && (json != null || data.method == "PUT")) {
+        if (json == null) json = [:]
+        rt.loginRetryMs = 0L
+        rt.loginBlockedUntil = 0L
         deliver(req, [json: json])
         return
     }
@@ -484,32 +498,51 @@ def loginDone(resp, Map data) {
         return
     }
     List cookies = cookiesOf(resp)
-    // A good login answers 302 to the portal with the session cookies. If the hub
-    // followed the redirect, a 200 with cookies and no login form also counts.
-    boolean ok = cookies && ((status in 300..399) || (status == 200 && !looksLikeLoginForm(bodyOf(resp))))
+    String location = headerOf(resp, "Location")
+    // A good login answers 302 to the portal with the session cookies; a failed one
+    // redirects back to the login page (Spring: /login?error). If the hub followed
+    // the redirect, a 200 with cookies and no login form also counts.
+    boolean toLogin = location != null && location.toLowerCase() =~ /login|error/
+    boolean ok = cookies && ((status >= 300 && status < 400 && !toLogin) || (status == 200 && !looksLikeLoginForm(bodyOf(resp))))
     if (!ok) {
-        long delay = Math.min(rt.loginRetryMs ? (rt.loginRetryMs as long) * 2 : LOGIN_RETRY_MIN, LOGIN_RETRY_MAX)
-        rt.loginRetryMs = delay
-        rt.loginBlockedUntil = now() + delay
-        state.status = "SolarEdge rejected the e-mail or password (HTTP ${status}). Next try in ${delay.intdiv(60000)} min, or save the settings again."
-        log.warn "SolarEdge: ${state.status}"
+        holdLogins("SolarEdge rejected the e-mail or password (HTTP ${status}${toLogin ? ', back to the login page' : ''})")
         failWaiting("Invalid e-mail and/or password", false, status)
         return
     }
-    rt.loginRetryMs = 0L
-    rt.loginBlockedUntil = 0L
-    logDebug "Login answered HTTP ${status} with cookies ${cookies.collect { it.split('=')[0] }}"
+    // Only a session that has carried an answer clears the login backoff (requestDone).
+    logDebug "Logged in: HTTP ${status}, cookies ${cookies.collect { it.split('=')[0] }}"
     rt.cookies = cookies
     rt.cookieGen = ((rt.cookieGen ?: 0) as int) + 1
+    rt.loggedInAt = now()
     state.status = "Logged in"
-    logDebug "Logged in (${cookies.size()} cookies)"
-    Map waiting = rt.waiting
-    List reqs = new ArrayList(waiting.values())
-    waiting.clear()
-    reqs.each { send(it) }
+    takeWaiting().each { send(it) }
 }
 
 private boolean looksLikeLoginForm(String body) { body != null && body.contains("j_password") }
+
+/** No automatic login for a while, doubling per failure from 1 min up to 1 h. */
+private void holdLogins(String why) {
+    Map rt = runtime()
+    long delay = Math.min(rt.loginRetryMs ? (rt.loginRetryMs as long) * 2 : LOGIN_RETRY_MIN, LOGIN_RETRY_MAX)
+    rt.loginRetryMs = delay
+    rt.loginBlockedUntil = now() + delay
+    rt.cookies = []
+    state.status = "${why}. Next login in ${delay.intdiv(60000)} min, or save the settings again."
+    log.warn "SolarEdge: ${state.status}"
+}
+
+/** One response header's value as text, or null. */
+String headerOf(resp, String name) {
+    def headers
+    try { headers = resp.getHeaders() } catch (e) { return null }
+    def found = null
+    if (headers instanceof Map) {
+        headers.each { k, v -> if (found == null && k?.toString()?.equalsIgnoreCase(name)) found = v instanceof Collection ? v[0] : v }
+    } else if (headers != null) {
+        headers.each { h -> if (found == null && headerText(h).toLowerCase().startsWith(name.toLowerCase() + ":")) found = h }
+    }
+    return found == null ? null : headerText(found).replaceFirst(/(?i)^${name}:\s*/, "")
+}
 
 /**
  * name=value of each Set-Cookie header. Hubitat hands headers as a map whose
@@ -551,11 +584,16 @@ private String headerText(def h) {
     return h.toString()
 }
 
-private void failWaiting(String msg, boolean outage, int status = 0) {
+/** The requests waiting for a login, oldest first, and the queue emptied. */
+private List takeWaiting() {
     Map waiting = runtime().waiting
-    List reqs = new ArrayList(waiting.values())
+    List reqs = new ArrayList(waiting.values()).sort { it.seq as long }
     waiting.clear()
-    reqs.each { deliver(it, [error: msg, status: status, outage: outage, login: !outage]) }
+    return reqs
+}
+
+private void failWaiting(String msg, boolean outage, int status = 0) {
+    takeWaiting().each { deliver(it, [error: msg, status: status, outage: outage, login: !outage]) }
 }
 
 // ---------------------------------------------------------------- ticks
@@ -603,7 +641,7 @@ def tick() {
         reporterId: it.getDataValue("reporterId"), serials: it.getDataValue("serials")] }, energy, slow)
     if (!reqs) return
 
-    Map tk = new ConcurrentHashMap([started: now(), energy: energy, slow: slow, results: new ConcurrentHashMap(),
+    Map tk = new ConcurrentHashMap([started: now(), results: new ConcurrentHashMap(),
         pending: new ConcurrentHashMap(), reqs: new ConcurrentHashMap()])
     reqs.each { tk.pending[it.key] = true; tk.reqs[it.key] = it }
     rt.tick = tk
@@ -644,6 +682,9 @@ List planTick(List devices, boolean energy, boolean slow) {
             if (slow) {
                 if (types.contains("inverter") || types.contains("meter") || types.contains("battery")) {
                     add(reqCommunication(siteId), [kind: "communication", siteId: siteId])
+                    // Whether the inverters sleep decides if "not ONLINE" is an alarm.
+                    List serials = serialsOf(devs) ?: (site.serials ? (site.serials as String).split(",") as List : [])
+                    if (serials) add(reqInverters(serials), [kind: "inverters", siteId: siteId])
                 }
                 if (types.contains("inverter")) add(reqAlerts(siteId), [kind: "alerts", siteId: siteId])
                 devs.findAll { it.type == "ev" && it.reporterId }.each {
@@ -691,7 +732,7 @@ def tickResult(Map result, Map ctx) {
     }
 }
 
-/** Requests carry their key in ctx (set here so a retried one keeps it). */
+/** Send a tick request; its key and the tick's start travel in ctx to tickResult. */
 private void sendTick(Map r, Map tk) { send(r + [cb: "tickResult", ctx: [started: tk.started, key: r.key]]) }
 
 /** All answers of a tick are in: back off or not, then events for every device. */
@@ -763,6 +804,10 @@ List eventsFor(def cd, String type, String siteId, Map by, long t) {
     Closure j = { k -> by[k.toString()]?.json }
     Map site = (state.sites ?: [:])[siteId] ?: [:]
     String dni = cd.deviceNetworkId
+    // The site's inverters asleep for the night: a site that isn't ONLINE is then expected.
+    // Without this tick's inverter data, a site whose solar was idle on the last power flow counts.
+    List live = new ArrayList((j("inverters:${siteId}")?.serialToLiveData ?: [:]).values())
+    boolean asleep = live ? isAsleep(live, t, timing().cadenceMs as Long) : ((state.solarIdle ?: [:])[siteId] as boolean)
     switch (type) {
         case "inverter":
             return inverterEvents(j("powerflow:${siteId}"), [overview: j("energyOverview:${siteId}"), inverters: j("inverters:${siteId}"),
@@ -770,9 +815,9 @@ List eventsFor(def cd, String type, String siteId, Map by, long t) {
                 cadenceMs: timing().cadenceMs, nowMs: t, scale: location.temperatureScale])
         case "meter":
             int y = yearIn(t, site.tz)
-            return meterEvents(j("powerflow:${siteId}"), [communication: j("communication:${siteId}"), totals: meterTotals(siteId, y)])
+            return meterEvents(j("powerflow:${siteId}"), [communication: j("communication:${siteId}"), totals: meterTotals(siteId, y), asleep: asleep])
         case "battery":
-            return batteryEvents(dni, j("powerflow:${siteId}"), j("batteries:${siteId}"), j("communication:${siteId}"))
+            return batteryEvents(dni, j("powerflow:${siteId}"), j("batteries:${siteId}"), j("communication:${siteId}"), asleep)
         case "ev":
             String rid = cd.getDataValue("reporterId")
             return evEvents(dni, rid, j("powerflow:${siteId}"), j("siteDevices:${siteId}"), j("sessions:${siteId}:${rid}"))
@@ -892,17 +937,25 @@ boolean isAsleep(List live, long nowMs, Long cadenceMs = null) {
 
 /**
  * Past years are walked back one per tick, from last year down to a hard floor:
- * the install year, else YEARS_BACK years ago. "No data" ends the walk (the site
- * did not exist yet); any other error aborts the run without storing anything,
- * and it starts again after YEARS_RETRY_MS. Finished years stay in state.
+ * the install year, else YEARS_BACK years ago, or the first year with data once
+ * SolarEdge said "no data" for the one before. Any other error aborts the run
+ * without storing anything, and it starts again after YEARS_RETRY_MS. Finished
+ * years stay in state; a gap (e.g. last year, missed around New Year) is asked
+ * for again.
  */
 Integer nextBackfillYear(String siteId, long t) {
+    Map ys = ((state.years ?: [:])[siteId] ?: [:])
+    if (ys.retryAt && t < (ys.retryAt as long)) return null
+    return missingYear(siteId, t)
+}
+
+/** The most recent past year without totals, down to the floor; null when complete. */
+Integer missingYear(String siteId, long t) {
     Map site = (state.sites ?: [:])[siteId] ?: [:]
     Map ys = ((state.years ?: [:])[siteId] ?: [:])
-    if (ys.done) return null
-    if (ys.retryAt && t < (ys.retryAt as long)) return null
     int current = yearIn(t, site.tz)
     int floor = site.installYear ? (site.installYear as int) : current - YEARS_BACK
+    if (ys.firstYear) floor = Math.max(floor, ys.firstYear as int)
     Map data = ys.data ?: [:]
     for (int y = current - 1; y >= floor; y--) {
         if (!data.containsKey(y as String)) return y
@@ -914,8 +967,8 @@ private void recordYear(Map req, Map res) {
     String siteId = req.siteId as String
     int year = req.year as int
     Map years = state.years ?: [:]
-    Map ys = years[siteId] ?: [:]
-    Map data = ys.data ?: [:]
+    Map ys = years[siteId] ? new LinkedHashMap(years[siteId]) : [:]
+    Map data = ys.data ? new LinkedHashMap(ys.data) : [:]
     Map site = (state.sites ?: [:])[siteId] ?: [:]
     int current = yearIn(now(), site.tz)
     def summary = res.json?.summary
@@ -926,31 +979,33 @@ private void recordYear(Map req, Map res) {
         data[year as String] = [(summary.import ?: 0) as double, (summary.export ?: 0) as double]
     } else if (noData && req.backfill) {
         // The site's first year was the one after; nothing older to ask.
-        ys.done = true
+        ys.firstYear = year + 1
         log.info "SolarEdge: meter totals for site ${siteId}: no data before ${year + 1}"
     } else if (req.backfill) {
         ys.retryAt = now() + YEARS_RETRY_MS
         log.warn "SolarEdge: meter totals for ${year} failed (${res.error}); trying again in 15 min"
     }
     ys.data = data
-    if (!ys.done && req.backfill && summary) {
-        int floor = site.installYear ? (site.installYear as int) : current - YEARS_BACK
-        if (year <= floor) ys.done = true
-    }
     years[siteId] = ys
     state.years = years
 }
 
-/** Lifetime import/export in kWh once every past year is in, plus this year's; null before. */
+/** Lifetime import/export in Wh once every past year is in, plus this year's; null before. */
 Map meterTotals(String siteId, int currentYear) {
     Map ys = (state.years ?: [:])[siteId]
-    if (!ys?.done || ys.current?.year != currentYear) {
-        return ys?.current?.year == currentYear ? [yearImported: ys.current.imported, yearExported: ys.current.exported] : null
-    }
+    if (ys?.current?.year != currentYear) return null
+    Map out = [yearImported: ys.current.imported, yearExported: ys.current.exported]
+    if (missingYear(siteId, now()) != null) return out
     double imp = ys.current.imported as double
     double exp = ys.current.exported as double
-    (ys.data ?: [:]).each { y, v -> imp += v[0] as double; exp += v[1] as double }
-    return [imported: imp, exported: exp, yearImported: ys.current.imported, yearExported: ys.current.exported]
+    int floor = ys.firstYear ? (ys.firstYear as int) : 0
+    (ys.data ?: [:]).each { y, v ->
+        if ((y as int) >= floor && (y as int) < currentYear) {
+            imp += v[0] as double
+            exp += v[1] as double
+        }
+    }
+    return out + [imported: imp, exported: exp]
 }
 
 // ---------------------------------------------------------------- discovery
@@ -959,10 +1014,14 @@ private void startDiscovery() {
     state.discovering = now()
     state.remove("discoverError")
     runtime().disc = new ConcurrentHashMap([pending: new ConcurrentHashMap(), found: new ConcurrentHashMap(), started: state.discovering])
-    send(reqSites() + [cb: "discoverSites", ctx: [:]])
+    send(reqSites() + [cb: "discoverSites", ctx: [run: state.discovering]])
 }
 
+/** Whether a discovery answer belongs to the run in progress (an older run's answers share its keys). */
+private boolean currentRun(Map ctx) { runtime().disc?.started == ctx.run }
+
 def discoverSites(Map result, Map ctx) {
+    if (!currentRun(ctx)) return
     if (!result.json) {
         state.remove("discovering")
         state.discoverError = result.error ?: "no answer"
@@ -971,7 +1030,9 @@ def discoverSites(Map result, Map ctx) {
     List sites = sitesOf(result.json)
     Map info = [:]
     sites.each { s ->
-        info[s.id as String] = [name: s.name, tz: s.timezone, installYear: s.installationDate ? yearIn(parseIso(s.installationDate), s.timezone) : null]
+        Long installed = parseIso(s.installationDate)
+        if (s.installationDate != null && installed == null) logOnce("install ${s.id}", "site ${s.id}: unknown installationDate format ${s.installationDate}")
+        info[s.id as String] = [name: s.name, tz: s.timezone, installYear: installed != null ? yearIn(installed, s.timezone) : null]
     }
     state.sites = info
     Map disc = runtime().disc
@@ -983,9 +1044,9 @@ def discoverSites(Map result, Map ctx) {
     }
     List reqs = []
     sites.each { s ->
-        reqs << reqPowerflow(s.id) + [ctx: [kind: "powerflow", siteId: s.id as String]]
-        reqs << reqSiteDevices(s.id) + [ctx: [kind: "siteDevices", siteId: s.id as String]]
-        reqs << reqEquipment(s.id) + [ctx: [kind: "equipment", siteId: s.id as String]]
+        reqs << reqPowerflow(s.id) + [ctx: [kind: "powerflow", siteId: s.id as String, run: ctx.run]]
+        reqs << reqSiteDevices(s.id) + [ctx: [kind: "siteDevices", siteId: s.id as String, run: ctx.run]]
+        reqs << reqEquipment(s.id) + [ctx: [kind: "equipment", siteId: s.id as String, run: ctx.run]]
     }
     reqs.each { disc.pending[it.key] = true }
     reqs.each { send(it + [cb: "discoverPart", ctx: it.ctx + [key: it.key]]) }
@@ -1000,7 +1061,7 @@ List sitesOf(def json) {
 
 def discoverPart(Map result, Map ctx) {
     Map disc = runtime().disc
-    if (!disc) return
+    if (!disc || !currentRun(ctx)) return
     disc.found[(ctx.kind + ":" + ctx.siteId) as String] = result.json ?: [:]
     disc.pending.remove(ctx.key)
     if (!disc.pending.isEmpty() || disc.putIfAbsent("finished", true) != null) return
@@ -1024,6 +1085,13 @@ Map offersFor(String siteId, String siteName, Map pf, Map devicesResp, Map equip
     Map out = [:]
     String name = siteName ?: "Site ${siteId}"
     List serials = equipmentSerials(equipment)
+    if (serials) {
+        Map sites = state.sites ?: [:]
+        if (sites[siteId]) {
+            sites[siteId] = sites[siteId] + [serials: serials.join(",")]
+            state.sites = sites
+        }
+    }
     out["solaredge-${siteId}-inverter"] = [type: "inverter", siteId: siteId, label: "${name} Inverter", serials: serials ? serials.join(",") : null]
     if (pf?.grid?.isActive) out["solaredge-${siteId}-meter"] = [type: "meter", siteId: siteId, label: "${name} Meter"]
     if (pf?.storage?.isActive || pf?.storage?.chargeLevel instanceof Number) out["solaredge-${siteId}-battery"] = [type: "battery", siteId: siteId, label: "${name} Battery"]
@@ -1158,13 +1226,13 @@ List meterEvents(Map pf, Map x = [:]) {
         out << ev("energyExportedYear", kwh(tot.yearExported), "kWh")
     }
     if (x.communication?.connectivityStatus instanceof String) {
-        out << ev("siteConnectivity", x.communication.connectivityStatus == "ONLINE" ? "online" : "offline")
+        out << ev("siteConnectivity", x.communication.connectivityStatus == "ONLINE" || x.asleep ? "online" : "offline")
     }
     return out
 }
 
 /** Battery: power (charging +), charge level, state; energies and health from getBatteries. */
-List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = null) {
+List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = null, boolean asleep = false) {
     List out = []
     def st = pf?.storage
     if (st) {
@@ -1200,7 +1268,7 @@ List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = nu
         if (full != null && plate) out << ev("stateOfHealth", Math.min(100, Math.round(full / plate * 100) as int), "%")
     }
     if (communication?.connectivityStatus instanceof String) {
-        out << ev("siteConnectivity", communication.connectivityStatus == "ONLINE" ? "online" : "offline")
+        out << ev("siteConnectivity", communication.connectivityStatus == "ONLINE" || asleep ? "online" : "offline")
     }
     return out
 }
@@ -1328,6 +1396,8 @@ List hlcEvents(String reporterId, Map devicesResp) {
 
 /** Epoch ms of an ISO 8601 time ("2026-10-15T11:50:28Z", with or without fraction or offset) or date. */
 Long parseIso(def s) {
+    // Epoch ms, as some SolarEdge answers give times.
+    if (s instanceof Number) return (s as long) > 0 ? s as long : null
     if (!(s instanceof String) || !s) return null
     String t = s.trim().replaceFirst(/\.\d+/, "")
     try {

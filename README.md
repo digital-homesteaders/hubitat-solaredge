@@ -40,9 +40,10 @@ Every device on a site is fed from the same answers:
   is skipped while the previous one still waits for answers.
 - An inverter-only site skips the 60-second polls at night and is read only
   on the 5-minute energy tick until the sun is back.
-- A site with an inverter, meter and battery makes about **2,900 requests a
-  day**. For comparison, Homey 1.8.1 sends about 86,000 for the same three
-  devices.
+- A site with an inverter, meter and battery makes **2,880 requests a day**
+  at the 60 s default, measured over a simulated day in the tests (4,416 with
+  an EV charger and a load controller as well). For comparison, Homey 1.8.1
+  sends about 86,000 for the same three devices.
 - Hubitat's asynchronous HTTP client manages its own connection pool, so
   reusing connections is up to the hub. This app keeps one login session
   for every device on the account.
@@ -59,18 +60,23 @@ These come from a review of the Homey app (1.8.1, and the 2.0.0 rewrite):
    per site.
 3. **Outages:** after an outage or an HTTP 429 the app pauses polling for
    twice the poll interval, doubling up to 30 minutes. A rejected login is
-   kept apart from a SolarEdge or network error. After a rejection, logins
-   are held back for 1 minute, doubling up to 1 hour. On a 401 or a redirect
-   to the login page the app logs in again once and retries.
+   kept apart from a SolarEdge or network error, and a login that SolarEdge
+   redirects back to its login page counts as a rejection. After a
+   rejection, logins are held back for 1 minute, doubling up to 1 hour. On a
+   401 or a redirect to the login page the app logs in again once and
+   retries. If the new session is turned away as well, logins are held back
+   the same way, so a broken session can't cause a login on every poll.
 4. **Night:** the inverter never goes offline at night or while idle. It
-   shows 0 W, `inverterStatus` becomes `sleeping`, and the site
-   connectivity alarm stays clear while the inverter sleeps. Devices show
+   shows 0 W and `inverterStatus` becomes `sleeping`. While the inverters
+   sleep, no device reports the site offline. Devices show
    `healthStatus: offline` only after 3 failed polls in a row.
 5. **Meter yearly totals:** the walk back through past years stops at a
    hard floor: the install year, or 10 years back if SolarEdge doesn't give
    one. "No data" ends the walk. Any other error aborts the run without
    storing anything, and it retries after 15 minutes. Finished years are
-   kept, and only the current year is refreshed, on the energy tick.
+   kept, and only the current year is refreshed, on the energy tick. A
+   missing year, such as last year when the hub was off over New Year, is
+   fetched later, and the lifetime totals wait for it.
 6. **Credentials:** the e-mail and password live only in the app's settings
    and are never written to a log, including the debug log. Devices don't
    get a copy.
@@ -128,7 +134,7 @@ one extra poll of the whole account. Power is in W and energy in kWh.
 | `solarPower`, `loadPower`, `batteryPower` | the site's power split: production, consumption, battery (charging positive) |
 | EnergyMeter `energy`, `energyImported`; `energyExported` | lifetime grid import and export, the sum of every year since install. They appear once all past years are in. |
 | `energyImportedYear`, `energyExportedYear` | this year |
-| `siteConnectivity` | online/offline |
+| `siteConnectivity` | online/offline. Offline is not reported while the inverters sleep. |
 
 ### SolarEdge Battery
 
@@ -139,6 +145,7 @@ one extra poll of the whole account. Power is in W and energy in kWh.
 | `chargingState` | charging, discharging, idle |
 | `energyCharged`, `energyDischarged` (EnergyMeter `energy` = discharged) | battery counters, kept rising if SolarEdge resets them |
 | `residualEnergy`, `stateOfHealth` | stored kWh; full-pack capacity as % of the nameplate |
+| `siteConnectivity` | online/offline. Offline is not reported while the inverters sleep. |
 
 The battery fields come from 2.0.0, which got them from another project
 (nerd2/solaredgego). Real battery answers haven't been seen yet.
@@ -197,10 +204,15 @@ Hubitat runs) against small stand-ins for the hub, then runs:
   These cases are ported from com.solaredge's `test/timing.js`.
 - **FlowTest**: the app and the real drivers end to end, with SolarEdge
   replayed from the synthetic site:
-  - discovery, the shared login, request counts per tick and per energy or
-    slow tick, the meter's past years, and events only on change
-  - 401 and expired-session retries, rejected-login backoff (1 min to 1 h),
-    and the difference between a login outage and a rejection
+  - discovery (including a restarted one), the shared login, request counts
+    per tick, per energy or slow tick and over a simulated day, the meter's
+    past years (including a year missed over New Year), and events only on
+    change
+  - 401 and expired-session retries, a new session turned away at once,
+    rejected-login backoff (1 min to 1 h), a login redirected back to the
+    login page, and the difference between a login outage and a rejection
+  - requests waiting for a login (same URL from two callers, commands kept
+    in order), commands answered 204, and the stale-tick limit
   - outage and 429 backoff, and `healthStatus` going offline after 3 failed
     polls
   - an inverter-only site at night, commands, the poll interval range and

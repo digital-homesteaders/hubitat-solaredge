@@ -132,6 +132,14 @@ check("meter: grid without a reading, discharging battery, totals") {
     assert !evs(app.meterEvents([grid: [isActive: false, currentPower: null]])).containsKey("power")
 }
 
+check("meter and battery: site not ONLINE while the inverters sleep is no alarm") {
+    Map offline = [connectivityStatus: "OFFLINE"]
+    assert evs(app.meterEvents(null, [communication: offline, asleep: true])).siteConnectivity == "online"
+    assert evs(app.meterEvents(null, [communication: offline, asleep: false])).siteConnectivity == "offline"
+    assert evs(app.batteryEvents("b", null, null, offline, true)).siteConnectivity == "online"
+    assert evs(app.batteryEvents("b", null, null, offline, false)).siteConnectivity == "offline"
+}
+
 // ---------------------------------------------------------------- battery
 
 check("battery: synthetic site (Wh energies)") {
@@ -257,6 +265,7 @@ check("ISO times") {
     assert app.parseIso("2026-10-15T13:50:28+02:00") == app.parseIso("2026-10-15T11:50:28Z")
     assert app.parseIso("2024-03-01") != null
     assert app.parseIso("junk") == null && app.parseIso(null) == null
+    assert app.parseIso(1709287200000L) == 1709287200000L
 }
 
 Check.finish()

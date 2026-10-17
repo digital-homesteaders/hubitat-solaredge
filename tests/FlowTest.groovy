@@ -78,10 +78,10 @@ FakeResp loginOk() { new FakeResp(status: 302, data: "", headers: ["Set-Cookie":
 
 List httpCalls() { app.calls.findAll { it[0] in ["asynchttpGet", "asynchttpPost", "asynchttpPut"] } }
 
-/** Answer every HTTP call the app has made, until it makes no more. Returns the calls answered. */
-List serve() {
+/** Answer every HTTP call the app has made (at most `limit`), until it makes no more. Returns the calls answered. */
+List serve(int limit = Integer.MAX_VALUE) {
     List done = []
-    while (true) {
+    while (done.size() < limit) {
         List all = httpCalls()
         if (answered >= all.size()) break
         List call = all[answered++]
@@ -141,7 +141,7 @@ check("discovery: one login, the sites, then per site power flow, devices and eq
     assert calls.count { it[0] == "asynchttpPost" } == 1
     assert gets(calls, "so/sites/") == 1 && gets(calls, "powerflow") == 1 && gets(calls, "equipment") == 1
     assert app.state.discovered.size() == 5
-    assert app.state.sites[SITE] == [name: "Synthetic site", tz: "Europe/Amsterdam", installYear: 2024]
+    assert app.state.sites[SITE] == [name: "Synthetic site", tz: "Europe/Amsterdam", installYear: 2024, serials: "7E000000-00"]
     assert !app.state.discovering
 }
 
@@ -189,7 +189,7 @@ check("fast tick: only the power flow and the devices list, plus the next past m
     // 2024 is the install year: the totals are complete.
     Map m = values(child("meter"))
     assert m.energyImported == 4400 && m.energyExported == 8300 && m.energy == 4400
-    assert app.state.years[SITE].done
+    assert app.missingYear(SITE, hub.clock) == null
 }
 
 check("unchanged values send no events; past years are not fetched again") {
@@ -214,15 +214,44 @@ check("energy tick: energy and battery data; slow data only every third") {
     assert unknown == []
 }
 
-check("requests per day for this site (60 s, all five devices)") {
-    app.state.years = [(SITE): [done: true]]
-    int fast = app.planTick([[type: "inverter", siteId: SITE, serials: "X"], [type: "meter", siteId: SITE], [type: "battery", siteId: SITE],
-        [type: "ev", siteId: SITE, reporterId: "1"], [type: "hlc", siteId: SITE, reporterId: "2"]], false, false).size()
-    assert fast == 2
-    // 1440 ticks a day, of which 288 energy ticks (+4) and 96 slow ones (+4 more): about 4,700.
-    int perDay = 1440 * 2 + 288 * 4 + 96 * 4
-    println "    about ${perDay} requests a day (com.solaredge 1.8.1: ~86,000 for three devices)"
-    assert perDay < 5000
+/** Requests over 24 simulated hours (60 s polls, energy ticks every 5 min), after the install and the past years. */
+int requestsPerDay(List picked) {
+    fresh()
+    app.mainPage()
+    app.devicesPage()
+    serve()
+    app.settings.selectedDevices = picked.collect { "solaredge-${SITE}-${it}".toString() }
+    app.installed()
+    hub.settle()
+    app.tick(); hub.settle(); serve()
+    fastTick()
+    fastTick()
+    // Optimizer temperatures for any day: the fixture's.
+    Map byInverter = synth.calls.find { it.method == "getSiteEnergyByInverter" }.result
+    override = { call -> call[2].path?.contains("by-inverter") ? ok(byInverter) : null }
+    int before = httpCalls().size()
+    (1..1440).each { int minute ->
+        hub.clock += 60000
+        if (minute % 5 == 0) app.energyTick() else app.tick()
+        hub.settle()
+        serve()
+    }
+    assert unknown == []
+    return httpCalls().size() - before
+}
+
+check("requests per day, measured: inverter, meter and battery (60 s)") {
+    int n = requestsPerDay(["inverter", "meter", "battery"])
+    println "    inverter + meter + battery: ${n} requests a day (com.solaredge 1.8.1: ~86,000)"
+    // 1440 power flows, 288 x (overview, inverters, batteries, this year), 96 x (by-inverter, communication, alerts)
+    assert n == 1440 + 288 * 4 + 96 * 3
+}
+
+check("requests per day, measured: all five devices (60 s)") {
+    int n = requestsPerDay(["inverter", "meter", "battery", "ev-1000001479067354", "hlc-102"])
+    println "    all five devices: ${n} requests a day"
+    // plus a devices list every poll and the EV history on slow ticks
+    assert n == 1440 * 2 + 288 * 4 + 96 * 4
 }
 
 // ---------------------------------------------------------------- overlap and retries
@@ -240,7 +269,7 @@ check("a tick never overlaps the previous one") {
     hub.clock += 60000
     app.tick()
     int sent2 = httpCalls().size()
-    hub.clock += 71000
+    hub.clock += 111000
     app.tick()
     assert httpCalls().size() > sent2
     serve()
@@ -260,6 +289,22 @@ check("401: log in again once and retry; a second 401 is an error, not a loop") 
     override = { call -> call[0] == "asynchttpGet" ? new FakeResp(status: 401, data: "") : null }
     fastTick()
     assert app.callsNamed("asynchttpPost").size() == logins + 2, "one more login for the tick, then errors, no loop"
+    // A session that dies right after login holds logins back: the next ticks don't log in.
+    Map rt = app.RUNTIME[app.app.id]
+    assert rt.loginRetryMs == 60000 && app.state.status.contains("new session")
+    hub.clock += 30000
+    app.tick(); hub.settle(); serve()
+    assert app.callsNamed("asynchttpPost").size() == logins + 2
+    // After the block: one cycle (login, the 401, one re-login), then held for twice as long.
+    hub.clock = rt.loginBlockedUntil + 1
+    app.tick(); hub.settle(); serve()
+    assert app.callsNamed("asynchttpPost").size() == logins + 4
+    assert rt.loginRetryMs == 120000
+    // Working again: the backoff clears.
+    override = null
+    hub.clock = rt.loginBlockedUntil + 1
+    fastTick()
+    assert rt.loginRetryMs == 0 && child("inverter").current.healthStatus == "online"
 }
 
 check("an expired session that redirects to the login page counts as logged out") {
@@ -301,6 +346,26 @@ check("rejected login: blocked 1 min, doubling up to 1 h, no login attempts whil
         delays << rt.loginRetryMs
     }
     assert delays == [120000, 240000, 480000, 960000, 1920000, 3600000].collect { it as long }
+}
+
+check("a login redirected back to the login page is a rejection, not a session") {
+    fresh()
+    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 302, data: "", headers: [
+        "Set-Cookie": new FakeHeaderEntry(name: "Set-Cookie", value: "JSESSIONID=abc; Path=/"),
+        "Location": new FakeHeaderEntry(name: "Location", value: "https://monitoring.solaredge.com/solaredge-web/p/login?error=true")]) : null }
+    app.devicesPage()
+    List calls = serve()
+    assert calls.count { it[0] == "asynchttpGet" } == 0
+    assert app.state.status.contains("rejected") && app.state.status.contains("login page")
+    assert app.RUNTIME[app.app.id].loginRetryMs == 60000
+    // A 302 to the portal is a good login.
+    fresh()
+    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 302, data: "", headers: [
+        "Set-Cookie": new FakeHeaderEntry(name: "Set-Cookie", value: "JSESSIONID=abc; Path=/"),
+        "Location": new FakeHeaderEntry(name: "Location", value: "https://monitoring.solaredge.com/solaredge-web/p/home")]) : null }
+    app.devicesPage()
+    serve()
+    assert app.state.discovered.size() == 5
 }
 
 check("a login that fails on SolarEdge's side is an outage, not a rejection") {
@@ -358,7 +423,7 @@ check("meter years: an error aborts the run and nothing is stored; no data ends 
     override = { call -> call[0] == "asynchttpGet" && call[2].path.contains("measurements") && call[2].query["end-date"] == "2025-12-31" ? new FakeResp(status: 500, data: "") : null }
     install()
     Map ys = app.state.years[SITE]
-    assert !ys.data?.containsKey("2025") && !ys.done && ys.retryAt
+    assert !ys.data?.containsKey("2025") && app.missingYear(SITE, hub.clock) == 2025 && ys.retryAt
     assert child("meter").current.energyImported == null
     List calls = fastTick()
     assert gets(calls, "measurements") == 0, "waits before the next run"
@@ -366,7 +431,7 @@ check("meter years: an error aborts the run and nothing is stored; no data ends 
     hub.clock = ys.retryAt + 1
     fastTick()
     fastTick()
-    assert app.state.years[SITE].done
+    assert app.missingYear(SITE, hub.clock) == null
     assert child("meter").current.energyImported == 4400
 }
 
@@ -387,7 +452,27 @@ check("meter years: hard floor without an install year, no data stops early") {
     // "No data" for 2023 ends the walk.
     app.state.years = [(SITE): [data: ["2025": [1, 1], "2024": [1, 1]]]]
     app.recordYear([siteId: SITE, year: 2023, backfill: true], [json: [summary: null]])
-    assert app.state.years[SITE].done && app.nextBackfillYear(SITE, t) == null
+    hub.settle()
+    assert app.state.years[SITE].firstYear == 2024 && app.nextBackfillYear(SITE, t) == null
+}
+
+check("meter years: last year missed around New Year is fetched later, totals wait for it") {
+    fresh()
+    install()
+    fastTick()
+    assert child("meter").current.energyImported == 4400
+    // The hub was off over New Year: 2026 never got into the past years.
+    hub.clock = Date.parse("yyyy-MM-dd'T'HH:mm:ssX", "2027-01-10T12:00:00Z").time
+    assert app.missingYear(SITE, hub.clock) == 2026
+    replay[app.reqMeasurements(SITE, 2027).key] = [summary: [import: 10000, export: 20000]]
+    replay[app.reqMeasurements(SITE, 2026).key] = [summary: [import: 1500000, export: 2900000]]
+    app.energyTick(); hub.settle()
+    List calls = serve()
+    assert calls.any { it[2].path.contains("measurements") && it[2].query["end-date"] == "2026-12-31" }
+    assert app.missingYear(SITE, hub.clock) == null
+    // 2024 + 2025 + 2026 + 2027 so far
+    assert child("meter").current.energyImported == 1200 + 1800 + 1500 + 10
+    assert unknown == []
 }
 
 // ---------------------------------------------------------------- night
@@ -427,6 +512,87 @@ check("commands: EV and load controller send activationState, then read back") {
     assert new JsonSlurper().parseText(puts[1][2].body) == [mode: "AUTO", level: null, duration: null]
     serve()
     assert app.callsNamed("runIn").any { it[1] == 5 && it[2] == "tick" }
+}
+
+check("requests waiting for a login: same URL from two callers, both answered") {
+    fresh()
+    install()
+    Map rt = app.RUNTIME[app.app.id]
+    rt.cookies = []
+    FakeDevice ev = child("ev-1000001479067354")
+    ev.on()
+    ev.off()
+    hub.settle()
+    serve()
+    List puts = app.callsNamed("asynchttpPut")
+    assert puts.size() == 2
+    assert puts.collect { new JsonSlurper().parseText(it[2].body).level } == [100, 0]
+    // A discovery and a tick both waiting for the power flow.
+    rt.cookies = []
+    app.state.discoveredAt = null
+    app.devicesPage()
+    hub.clock += 60000
+    app.tick()
+    hub.settle()
+    List calls = serve()
+    assert gets(calls, "powerflow") == 2
+    assert app.state.discovered.size() == 5 && !app.state.discovering
+    assert app.RUNTIME[app.app.id].tick == null, "the tick finished"
+}
+
+check("commands answered 204 without a body count as sent") {
+    fresh()
+    install()
+    override = { call -> call[0] == "asynchttpPut" ? new FakeResp(status: 204, data: "") : null }
+    child("hlc-102").off()
+    serve()
+    assert app.log.at("info").any { it.contains("off sent") }
+    assert !app.log.at("warn").any { it.contains("failed") }
+    assert app.callsNamed("runIn").last()[1] == 5
+}
+
+check("a tick is only given up on after the longest legitimate chain") {
+    fresh()
+    install()
+    hub.clock += 60000
+    app.tick()
+    int sent = httpCalls().size()
+    hub.clock += 100000
+    app.tick()
+    assert httpCalls().size() == sent, "still within login + request + re-login + retry + follow-up"
+    hub.clock += 11000
+    app.tick()
+    assert httpCalls().size() > sent
+    serve()
+}
+
+check("discovery restarted while the old one is out: old answers are ignored") {
+    fresh()
+    app.devicesPage()
+    serve(2)                                // login + sites; the three per-site calls are now out
+    int oldEnd = httpCalls().size()
+    assert app.state.discovering && oldEnd - answered == 3
+    hub.clock += 100000                     // the page gives up and starts again
+    app.devicesPage()
+    hub.settle()
+    assert httpCalls().size() == oldEnd + 1, "the new run asks for the sites"
+    // serve() answers the old run's calls first: they must not finish the new run.
+    serve(3)
+    assert app.state.discovering, "old answers finished the new run"
+    serve()
+    assert app.state.discovered.size() == 5
+    assert !app.state.discovering
+}
+
+check("discovery copes with installationDate as epoch ms or an unknown format") {
+    [1709287200000L, "1st March 2024", null].eachWithIndex { def inst, int i ->
+        fresh()
+        replay[app.reqSites().key] = [sites: [(SITE): [id: SITE as long, name: "Synthetic site", timezone: "Europe/Amsterdam", installationDate: inst]]]
+        app.devicesPage()
+        serve()
+        assert app.state.discovered.size() == 5, inst
+        assert app.state.sites[SITE].installYear == (i == 0 ? 2024 : null)
+    }
 }
 
 check("poll interval: default 60 s, clamped to 30-300") {

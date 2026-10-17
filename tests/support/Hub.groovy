@@ -142,8 +142,6 @@ abstract class HubitatScript extends Script {
     void asynchttpPost(String cb, Map params, Map data = null) { calls << ["asynchttpPost", cb, params, data] }
     void asynchttpPut(String cb, Map params, Map data = null) { calls << ["asynchttpPut", cb, params, data] }
 
-    // ---- WebSocket (drivers)
-    Map getInterfaces() { [webSocket: new FakeWebSocket(calls: calls)] }
 
     // ---- events (drivers)
     void sendEvent(Map e) { device.applyEvent(e) }
@@ -187,15 +185,6 @@ class Swallow {
         return null
     }
     def propertyMissing(String name) { script.getProperty(name) }
-}
-
-class FakeWebSocket {
-    List calls
-    // connect("wss://...", pingInterval: 15) arrives as connect(Map, String).
-    void connect(Map opts, String url) { calls << ["ws.connect", url, opts] }
-    void connect(String url) { calls << ["ws.connect", url, [:]] }
-    void close() { calls << ["ws.close"] }
-    void sendMessage(String msg) { calls << ["ws.send", msg] }
 }
 
 class FakeLog {
