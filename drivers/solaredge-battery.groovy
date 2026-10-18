@@ -24,6 +24,7 @@ metadata {
         attribute "residualEnergy", "number"
         attribute "stateOfHealth", "number"
         attribute "siteConnectivity", "enum", ["online", "offline"]
+        attribute "summary", "string"
         attribute "healthStatus", "enum", ["online", "offline"]
     }
     preferences {
@@ -53,7 +54,7 @@ def refresh() {
 
 // ---------------------------------------------------------------- events from the app
 
-/** Send the events whose value changed. */
+/** Send the events whose value changed, then the summary line with units. */
 void applyEvents(List events) {
     events.each { Map e ->
         if (e.value == null || same(device.currentValue(e.name as String), e.value)) return
@@ -63,6 +64,7 @@ void applyEvents(List events) {
         if (logEnable) log.debug "${device.displayName}: ${e.name} ${device.currentValue(e.name as String)} -> ${e.value}"
         sendEvent(evt)
     }
+    sendSummary()
 }
 
 private boolean same(def current, def value) {
@@ -74,4 +76,52 @@ private boolean same(def current, def value) {
         return false
     }
     return current.toString() == value.toString()
+}
+
+// ---------------------------------------------------------------- summary
+
+private def cv(String attr) { device.currentValue(attr) }
+
+private BigDecimal num(def v) {
+    if (v == null) return null
+    try { return v as BigDecimal } catch (e) { return null }
+}
+
+/** "850 W" or "10.0 kW", without a sign. */
+private String fmtPower(def w) {
+    BigDecimal v = num(w)?.abs()
+    if (v == null) return null
+    return v >= 1000 ? "${fmt(v / 1000, 1)} kW" : "${fmt(v, 0)} W"
+}
+
+/** "9.8 kWh", or "4,346 kWh" from 100 up. */
+private String fmtEnergy(def kwh) {
+    BigDecimal v = num(kwh)
+    if (v == null) return null
+    return "${fmt(v, v.abs() >= 100 ? 0 : 1)} kWh"
+}
+
+private String fmt(BigDecimal v, int decimals) { String.format("%,." + decimals + "f", v) }
+
+private String joinParts(List parts) { parts.findAll { it }.join(" · ") }
+
+private void sendSummary() {
+    String s = summaryText()
+    if (s && !same(cv("summary"), s)) sendEvent(name: "summary", value: s)
+}
+
+/** E.g. "Discharging 10.0 kW · 35 % · 7.2 kWh left · charged 0.0 kWh · discharged 9.8 kWh · health 100 %". */
+private String summaryText() {
+    String st = cv("chargingState")
+    BigDecimal p = num(cv("power"))
+    String head = st == "charging" ? "Charging ${fmtPower(p) ?: ''}".trim() : st == "discharging" ? "Discharging ${fmtPower(p) ?: ''}".trim() : st == "idle" ? "Idle" : null
+    joinParts([
+        head,
+        cv("battery") != null ? "${cv('battery')} %" : null,
+        cv("residualEnergy") != null ? "${fmtEnergy(cv('residualEnergy'))} left" : null,
+        cv("energyCharged") != null ? "charged ${fmtEnergy(cv('energyCharged'))}" : null,
+        cv("energyDischarged") != null ? "discharged ${fmtEnergy(cv('energyDischarged'))}" : null,
+        cv("stateOfHealth") != null ? "health ${cv('stateOfHealth')} %" : null,
+        cv("siteConnectivity") == "offline" ? "site offline" : null,
+    ])
 }

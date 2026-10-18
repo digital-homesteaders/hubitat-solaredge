@@ -110,7 +110,14 @@ For several SolarEdge accounts, add the app once per account.
 ## Devices
 
 All devices have `healthStatus` (online/offline) and Refresh. Refresh triggers
-one extra poll of the whole account. Power is in W and energy in kWh.
+one extra poll of the whole account.
+
+Units: power is in W, energy in kWh, voltage in V, and charge level and
+health in %. Every event carries its unit, which dashboards and the Events
+list show. Hubitat's **Current States** panel doesn't show units, so every
+device also has a **`summary`** attribute: one line with units, for example
+"Discharging 10.0 kW · 35 % · 7.2 kWh left · charged 0.0 kWh · discharged
+9.8 kWh · health 100 %". The numeric attributes stay plain numbers for rules.
 
 ### SolarEdge Inverter
 
@@ -146,6 +153,9 @@ one extra poll of the whole account. Power is in W and energy in kWh.
 | `energyCharged`, `energyDischarged` (EnergyMeter `energy` = discharged) | battery counters, kept rising if SolarEdge resets them |
 | `residualEnergy`, `stateOfHealth` | stored kWh; full-pack capacity as % of the nameplate |
 | `siteConnectivity` | online/offline. Offline is not reported while the inverters sleep. |
+
+SolarEdge reports the discharge counter as a negative number (seen on a real
+battery). Both counters are shown as positive amounts.
 
 The battery fields come from 2.0.0, which got them from another project
 (nerd2/solaredgego). Real battery answers haven't been seen yet.

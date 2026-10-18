@@ -158,6 +158,17 @@ check("battery: kWh energies when the nameplate is below 100; discharging is neg
     assert v.power == -1250 && v.chargingState == "discharging"
 }
 
+check("battery: a negative discharge counter (as seen live) is shown as an amount") {
+    app.state.clear()
+    Map bat = [chargeEnergy: 0, dischargeEnergy: -9818, remainingEnergy: 7202, fullPackEnergy: 10000, namePlateEnergy: 9700]
+    Map v = evs(app.batteryEvents("b3", [storage: [currentPower: 10.0, status: "discharging", chargeLevel: 35]], [devicesByType: [BATTERY: [bat]]]))
+    assert v.energyDischarged == 9.818 && v.energy == 9.818 && v.energyCharged == 0
+    assert v.power == -10000 && v.residualEnergy == 7.202 && v.stateOfHealth == 100
+    // The counter state left by the old negative value doesn't hold the new one back.
+    app.state.counters = ["b4:discharged": [last: -9.818, offset: 0, falling: false]]
+    assert evs(app.batteryEvents("b4", null, [devicesByType: [BATTERY: [bat]]])).energyDischarged == 9.818
+}
+
 check("counters never fall (com.solaredge devices.js sequence)") {
     app.state.clear()
     List got = [10, 12, 3, 5, 6, 1, 1, 0, 1, 2].collect { app.monotonic("d", "test", it as double) }

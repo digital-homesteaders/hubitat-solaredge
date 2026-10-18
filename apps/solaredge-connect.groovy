@@ -1254,8 +1254,9 @@ List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = nu
             units[dni] = toKwh
             state.units = units
         }
-        Double charged = sumOf(bats, "chargeEnergy")
-        Double discharged = sumOf(bats, "dischargeEnergy")
+        // Seen live (2026-10-17): dischargeEnergy comes negative (-9818 Wh). Both are amounts.
+        Double charged = absOrNull(sumOf(bats, "chargeEnergy"))
+        Double discharged = absOrNull(sumOf(bats, "dischargeEnergy"))
         Double remaining = sumOf(bats, "remainingEnergy")
         Double full = sumOf(bats, "fullPackEnergy")
         if (charged != null) out << ev("energyCharged", round(monotonic(dni, "charged", charged * toKwh), 3), "kWh")
@@ -1272,6 +1273,8 @@ List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = nu
     }
     return out
 }
+
+private Double absOrNull(Double v) { v == null ? null : Math.abs(v) }
 
 private Double sumOf(List items, String key) {
     List vals = items.collect { it[key] }

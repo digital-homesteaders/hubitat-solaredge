@@ -29,6 +29,7 @@ metadata {
         attribute "optimizerTemperatureMax", "number"
         attribute "alerts", "number"
         attribute "siteConnectivity", "enum", ["online", "offline"]
+        attribute "summary", "string"
         attribute "healthStatus", "enum", ["online", "offline"]
     }
     preferences {
@@ -58,7 +59,7 @@ def refresh() {
 
 // ---------------------------------------------------------------- events from the app
 
-/** Send the events whose value changed. */
+/** Send the events whose value changed, then the summary line with units. */
 void applyEvents(List events) {
     events.each { Map e ->
         if (e.value == null || same(device.currentValue(e.name as String), e.value)) return
@@ -68,6 +69,7 @@ void applyEvents(List events) {
         if (logEnable) log.debug "${device.displayName}: ${e.name} ${device.currentValue(e.name as String)} -> ${e.value}"
         sendEvent(evt)
     }
+    sendSummary()
 }
 
 private boolean same(def current, def value) {
@@ -79,4 +81,57 @@ private boolean same(def current, def value) {
         return false
     }
     return current.toString() == value.toString()
+}
+
+// ---------------------------------------------------------------- summary
+
+private def cv(String attr) { device.currentValue(attr) }
+
+private BigDecimal num(def v) {
+    if (v == null) return null
+    try { return v as BigDecimal } catch (e) { return null }
+}
+
+/** "850 W" or "10.0 kW", without a sign. */
+private String fmtPower(def w) {
+    BigDecimal v = num(w)?.abs()
+    if (v == null) return null
+    return v >= 1000 ? "${fmt(v / 1000, 1)} kW" : "${fmt(v, 0)} W"
+}
+
+/** "9.8 kWh", or "4,346 kWh" from 100 up. */
+private String fmtEnergy(def kwh) {
+    BigDecimal v = num(kwh)
+    if (v == null) return null
+    return "${fmt(v, v.abs() >= 100 ? 0 : 1)} kWh"
+}
+
+private String fmt(BigDecimal v, int decimals) { String.format("%,." + decimals + "f", v) }
+
+private String joinParts(List parts) { parts.findAll { it }.join(" · ") }
+
+private void sendSummary() {
+    String s = summaryText()
+    if (s && !same(cv("summary"), s)) sendEvent(name: "summary", value: s)
+}
+
+/** E.g. "Producing 5.6 kW · today 7.1 kWh · month 177 kWh · year 4,346 kWh · lifetime 29,339 kWh · 234.8 V". */
+private String summaryText() {
+    BigDecimal p = num(cv("power"))
+    String status = cv("inverterStatus")
+    String head = status == "sleeping" ? "Sleeping" : (p ? "Producing ${fmtPower(p)}" : (p == 0 ? "Not producing" : null))
+    BigDecimal alerts = num(cv("alerts"))
+    BigDecimal temp = num(cv("optimizerTemperatureMax"))
+    joinParts([
+        head,
+        cv("energyToday") != null ? "today ${fmtEnergy(cv('energyToday'))}" : null,
+        cv("energyMonth") != null ? "month ${fmtEnergy(cv('energyMonth'))}" : null,
+        cv("energyYear") != null ? "year ${fmtEnergy(cv('energyYear'))}" : null,
+        cv("energyLifetime") != null ? "lifetime ${fmtEnergy(cv('energyLifetime'))}" : null,
+        num(cv("voltage")) != null ? "${fmt(num(cv('voltage')), 1)} V" : null,
+        temp != null ? "optimizers up to ${fmt(temp, 0)} °${location?.temperatureScale ?: 'C'}" : null,
+        status && !(status in ["production", "sleeping"]) ? "status ${status.replace('_', ' ')}" : null,
+        alerts ? "${alerts} alert${alerts == 1 ? '' : 's'}" : null,
+        cv("siteConnectivity") == "offline" ? "site offline" : null,
+    ])
 }

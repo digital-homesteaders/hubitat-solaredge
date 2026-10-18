@@ -180,6 +180,33 @@ check("first tick: device values (com.solaredge's synthetic expectations)") {
     assert m.energyImported == null, "lifetime totals wait for the past years"
 }
 
+check("first tick: each device's summary line, with units") {
+    assert child("battery").current.summary == "Charging 500 W · 62 % · 6.2 kWh left · charged 1,235 kWh · discharged 1,000 kWh · health 95 %"
+    assert child("ev-1000001479067354").current.summary == "Charging 9.5 kW · session 0.1 kWh, 1 min · manual mode · Ioniq · 127 kWh charged in the past year"
+    assert child("hlc-102").current.summary == "On (manual) · 2.0 kW (estimated)"
+    assert child("meter").current.summary == "Exporting 1.2 kW to the grid · solar 5.6 kW · home 800 W · battery charging 500 W · this year imported 1,400 kWh, exported 2,700 kWh"
+    String inv = child("inverter").current.summary
+    assert inv.startsWith("Producing 5.6 kW · today 7.1 kWh · month 177 kWh · year 4,346 kWh · lifetime 29,339 kWh · ")
+    assert inv =~ / \d{3}\.\d V · optimizers up to 100 °F · 1 alert$/
+    // Only when it changes, and not logged as a description.
+    assert child("battery").events.count { it.name == "summary" } == 1
+}
+
+check("summary: night inverter, idle grid, unplugged charger") {
+    FakeDevice d = hub.device("SolarEdge Inverter", "x-inv")
+    d.applyEvents([[name: "power", value: 0, unit: "W"], [name: "inverterStatus", value: "sleeping"], [name: "energyToday", value: 31.25, unit: "kWh"]])
+    assert d.current.summary == "Sleeping · today 31.3 kWh"
+    FakeDevice m = hub.device("SolarEdge Meter", "x-m")
+    m.applyEvents([[name: "gridPower", value: 0], [name: "power", value: 0], [name: "batteryPower", value: -10000], [name: "siteConnectivity", value: "offline"]])
+    assert m.current.summary == "No grid exchange · battery discharging 10.0 kW · site offline"
+    FakeDevice e = hub.device("SolarEdge EV Charger", "x-ev")
+    e.applyEvents([[name: "chargingState", value: "plugged_out"], [name: "power", value: 0], [name: "chargeMode", value: "auto"], [name: "solarCharging", value: "on"]])
+    assert e.current.summary == "Unplugged · auto mode · solar charging on"
+    FakeDevice b = hub.device("SolarEdge Battery", "x-b")
+    b.applyEvents([[name: "chargingState", value: "discharging"], [name: "power", value: -10000], [name: "battery", value: 35], [name: "energyDischarged", value: 9.818]])
+    assert b.current.summary == "Discharging 10.0 kW · 35 % · discharged 9.8 kWh"
+}
+
 check("fast tick: only the power flow and the devices list, plus the next past meter year") {
     List calls = fastTick()
     assert unknown == []
