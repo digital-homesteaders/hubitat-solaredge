@@ -37,12 +37,16 @@ Every device on a site is fed from the same answers:
 | Once | the meter's past years, one per poll, then kept |
 
 - Identical requests in one tick go out once, and ticks never overlap: a tick
-  is skipped while the previous one still waits for answers.
+  is skipped while the previous one still waits for answers. Because 5
+  minutes is a whole number of polls, a poll lands on every energy tick; that
+  poll is left to the energy tick, which reads the power flow too. An energy
+  tick that still finds a poll in flight runs as soon as that poll is done.
 - An inverter-only site skips the 60-second polls at night and is read only
   on the 5-minute energy tick until the sun is back.
-- A site with an inverter, meter and battery makes **2,880 requests a day**
-  at the 60 s default, measured over a simulated day in the tests (4,416 with
-  an EV charger and a load controller as well). For comparison, Homey 1.8.1
+- A site with an inverter, meter and battery makes **about 2,890 requests a
+  day** at the 60 s default, measured over a simulated day that follows the
+  app's own timers (about 4,420 with an EV charger and a load controller as
+  well). For comparison, Homey 1.8.1
   sends about 86,000 for the same three devices.
 - Hubitat's asynchronous HTTP client manages its own connection pool, so
   reusing connections is up to the hub. This app keeps one login session
@@ -150,15 +154,23 @@ device also has a **`summary`** attribute: one line with units, for example
 | Battery `battery` | charge level % |
 | PowerMeter `power` | charging positive, discharging negative |
 | `chargingState` | charging, discharging, idle |
-| `energyCharged`, `energyDischarged` (EnergyMeter `energy` = discharged) | battery counters, kept rising if SolarEdge resets them |
-| `residualEnergy`, `stateOfHealth` | stored kWh; full-pack capacity as % of the nameplate |
+| `energyCharged`, `energyDischarged` (EnergyMeter `energy` = discharged) | integrated from the battery power at every poll; see below |
+| `residualEnergy`, `stateOfHealth` | stored kWh, summed over the batteries; full-pack capacity as % of the nameplate. Read on the 5-minute energy tick. |
 | `siteConnectivity` | online/offline. Offline is not reported while the inverters sleep. |
 
-SolarEdge reports the discharge counter as a negative number (seen on a real
-battery). Both counters are shown as positive amounts.
+SolarEdge's own charge and discharge counters are not used. On a real
+two-battery site they stay at 0.0 although the batteries cycle every day, and
+another site reported them negative. Instead, the app adds up the battery
+power from each poll:
+- It uses trapezoids, and splits the interval where the power crosses zero,
+  so charging never cancels out discharging.
+- A gap longer than 10 minutes or 3 polls (an outage, a hub restart) isn't
+  counted.
+- The totals start at 0 and are kept across restarts. They are only as exact
+  as the poll interval allows.
 
-The battery fields come from 2.0.0, which got them from another project
-(nerd2/solaredgego). Real battery answers haven't been seen yet.
+The stored energy and health are checked against a real answer from two
+SolarEdge Home Battery 400V (`tests/fixtures/batteries-two.json`).
 
 ### SolarEdge EV Charger
 

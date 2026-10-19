@@ -68,6 +68,11 @@ preferences {
 @Field static final long STALE_TICK_MS = 5 * 20 * 1000L + 10000L
 // Every third energy tick (15 minutes) also fetches the slow data.
 @Field static final int SLOW_EVERY = 3
+// A fast tick this close before the energy tick is left to the energy tick (which polls too).
+@Field static final long ENERGY_MERGE_MS = 15 * 1000L
+// Battery charged/discharged are integrated from power samples; not across a gap longer
+// than this or 3 poll intervals (an outage, a hub restart).
+@Field static final long MAX_SAMPLE_GAP_MS = 10 * 60 * 1000L
 // After rejected credentials no automatic login for this long, doubling per rejection.
 @Field static final long LOGIN_RETRY_MIN = 60 * 1000L
 @Field static final long LOGIN_RETRY_MAX = 60 * 60 * 1000L
@@ -226,7 +231,7 @@ void initialize() {
     syncChildren()
     state.timing = timing()
     if (siteDevices()) {
-        state.energyDue = true
+        rt.energyDue = true
         runIn(2, "tick")
         scheduleEnergyTick()
     }
@@ -598,12 +603,17 @@ private void failWaiting(String msg, boolean outage, int status = 0) {
 
 // ---------------------------------------------------------------- ticks
 
+/**
+ * The 5-minute energy tick. Its flags live in memory, not in state: a tick's
+ * answers are handled in another execution, which writes back the state it
+ * loaded earlier and would erase a flag set here meanwhile (Hubitat keeps the
+ * last write). With a tick still in flight, finishTick runs it straight after.
+ */
 def energyTick() {
     scheduleEnergyTick()
-    state.energyDue = true
-    Map tm = timing()
-    tm.judgePending = true
-    state.timing = tm
+    Map rt = runtime()
+    rt.energyDue = true
+    rt.judgePending = true
     tick()
 }
 
@@ -630,12 +640,18 @@ def tick() {
     List devices = siteDevices()
     if (!devices) return
 
-    boolean energy = state.energyDue as boolean
-    state.energyDue = false
+    // 300 s is a multiple of the poll interval, so a fast tick lands on every energy
+    // tick: leave that poll to the energy tick instead of colliding with it.
+    long untilEnergy = rt.nextEnergyAt ? (rt.nextEnergyAt as long) - now() : -1L
+    if (!rt.energyDue && untilEnergy >= 0 && untilEnergy <= ENERGY_MERGE_MS) {
+        logDebug "Tick left to the energy tick due in ${untilEnergy.intdiv(1000)} s"
+        return
+    }
+    boolean energy = rt.remove("energyDue") as boolean
     boolean slow = false
     if (energy) {
-        state.energyCount = ((state.energyCount ?: 0) as int) + 1
-        slow = (state.energyCount as int) % SLOW_EVERY == 1
+        rt.energyCount = ((rt.energyCount ?: 0) as int) + 1
+        slow = (rt.energyCount as int) % SLOW_EVERY == 1
     }
     List reqs = planTick(devices.collect { [type: it.getDataValue("type"), siteId: it.getDataValue("siteId"),
         reporterId: it.getDataValue("reporterId"), serials: it.getDataValue("serials")] }, energy, slow)
@@ -727,8 +743,14 @@ def tickResult(Map result, Map ctx) {
     }
     tk.pending.remove(key)
     if (tk.pending.isEmpty() && tk.putIfAbsent("finished", true) == null) {
-        rt.remove("tick")
-        finishTick(tk)
+        // The tick counts as running until its events are out, so no tick starts meanwhile.
+        try {
+            finishTick(tk)
+        } finally {
+            rt.remove("tick")
+        }
+        // An energy tick that came while this one was out goes now.
+        if (rt.energyDue) runIn(1, "tick")
     }
 }
 
@@ -817,7 +839,7 @@ List eventsFor(def cd, String type, String siteId, Map by, long t) {
             int y = yearIn(t, site.tz)
             return meterEvents(j("powerflow:${siteId}"), [communication: j("communication:${siteId}"), totals: meterTotals(siteId, y), asleep: asleep])
         case "battery":
-            return batteryEvents(dni, j("powerflow:${siteId}"), j("batteries:${siteId}"), j("communication:${siteId}"), asleep)
+            return batteryEvents(dni, j("powerflow:${siteId}"), j("batteries:${siteId}"), j("communication:${siteId}"), asleep, t)
         case "ev":
             String rid = cd.getDataValue("reporterId")
             return evEvents(dni, rid, j("powerflow:${siteId}"), j("siteDevices:${siteId}"), j("sessions:${siteId}:${rid}"))
@@ -838,7 +860,9 @@ private Map timing() {
 }
 
 private void scheduleEnergyTick() {
-    runInMillis(delayToNextTick(now(), (state.timing?.phaseMs ?: 0) as long), "energyTick")
+    long delay = delayToNextTick(now(), (state.timing?.phaseMs ?: 0) as long)
+    runtime().nextEnergyAt = now() + delay
+    runInMillis(delay, "energyTick")
 }
 
 /** An inverter's latest upload moment for each serial in a getInvertersInformation answer. */
@@ -860,8 +884,9 @@ void noteSnapshot(String serial, long at, long nowMs) {
     snaps[serial] = at
     tm.snapshots = snaps
     if (previous && at > previous) tm.cadenceMs = learnCadence(tm.cadenceMs as Long, at - previous)
-    if (tm.judgePending && previous && judgesTick(previous, at, nowMs, (tm.cadenceMs ?: PERIOD_MS) as long)) {
-        tm.judgePending = false
+    Map rt = runtime()
+    if (rt.judgePending && previous && judgesTick(previous, at, nowMs, (tm.cadenceMs ?: PERIOD_MS) as long)) {
+        rt.remove("judgePending")
         long margin = adaptMargin(tm.marginMs as long, at > previous)
         if (margin != (tm.marginMs as long)) {
             logDebug "Energy tick margin ${(tm.marginMs as long).intdiv(1000)}s -> ${margin.intdiv(1000)}s"
@@ -1232,7 +1257,12 @@ List meterEvents(Map pf, Map x = [:]) {
 }
 
 /** Battery: power (charging +), charge level, state; energies and health from getBatteries. */
-List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = null, boolean asleep = false) {
+/**
+ * Battery: power (charging +), charge level and state from the power flow, with
+ * charged/discharged integrated from that power (batteryFlow); stored energy and
+ * health from getBatteries.
+ */
+List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = null, boolean asleep = false, Long nowMs = null) {
     List out = []
     def st = pf?.storage
     if (st) {
@@ -1240,6 +1270,11 @@ List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = nu
         Integer p = watts(st.currentPower)
         if (p != null && status == "discharging") p = -p
         out << ev("power", p ?: 0, "W")
+        Map flow = batteryFlow(dni, p ?: 0, nowMs ?: now())
+        BigDecimal discharged = round(flow.discharged, 3)
+        out << ev("energyCharged", round(flow.charged, 3), "kWh")
+        out << ev("energyDischarged", discharged, "kWh")
+        out << ev("energy", discharged, "kWh")
         if (st.chargeLevel instanceof Number) out << ev("battery", Math.round(st.chargeLevel as double) as int, "%")
         if (status in ["charging", "discharging", "idle"]) out << ev("chargingState", status)
     }
@@ -1254,17 +1289,10 @@ List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = nu
             units[dni] = toKwh
             state.units = units
         }
-        // Seen live (2026-10-17): dischargeEnergy comes negative (-9818 Wh). Both are amounts.
-        Double charged = absOrNull(sumOf(bats, "chargeEnergy"))
-        Double discharged = absOrNull(sumOf(bats, "dischargeEnergy"))
+        // chargeEnergy/dischargeEnergy are not used: 0.0 on a real two-battery site that
+        // cycles daily, and negative on another (2026-10-17/18).
         Double remaining = sumOf(bats, "remainingEnergy")
         Double full = sumOf(bats, "fullPackEnergy")
-        if (charged != null) out << ev("energyCharged", round(monotonic(dni, "charged", charged * toKwh), 3), "kWh")
-        if (discharged != null) {
-            BigDecimal d = round(monotonic(dni, "discharged", discharged * toKwh), 3)
-            out << ev("energyDischarged", d, "kWh")
-            out << ev("energy", d, "kWh")
-        }
         if (remaining != null) out << ev("residualEnergy", round(remaining * toKwh, 3), "kWh")
         if (full != null && plate) out << ev("stateOfHealth", Math.min(100, Math.round(full / plate * 100) as int), "%")
     }
@@ -1274,7 +1302,41 @@ List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = nu
     return out
 }
 
-private Double absOrNull(Double v) { v == null ? null : Math.abs(v) }
+/**
+ * Charged and discharged kWh so far, integrated from the battery power samples
+ * (W, charging positive) of each poll. Kept in state, so the totals survive
+ * restarts; a gap longer than MAX_SAMPLE_GAP_MS or 3 poll intervals isn't counted.
+ */
+Map batteryFlow(String dni, int powerW, long t) {
+    Map all = state.flow ?: [:]
+    Map f = all[dni] ? new LinkedHashMap(all[dni]) : [charged: 0d, discharged: 0d]
+    long gap = Math.max(MAX_SAMPLE_GAP_MS, 3L * pollInterval() * 1000L)
+    if (f.t != null && t > (f.t as long) && t - (f.t as long) <= gap) {
+        List kwh = batteryFlowKwh(f.w as double, powerW as double, (t - (f.t as long)) / 1000d)
+        f.charged = (f.charged as double) + (kwh[0] as double)
+        f.discharged = (f.discharged as double) + (kwh[1] as double)
+    }
+    f.t = t
+    f.w = powerW
+    all[dni] = f
+    state.flow = all
+    return f
+}
+
+/**
+ * [charged, discharged] kWh between two power samples: trapezoids, and when the
+ * sign changes the interval is split where the power crosses zero, so charging
+ * never cancels discharging.
+ */
+List batteryFlowKwh(double previousW, double currentW, double seconds) {
+    double hours = seconds / 3600d
+    if (previousW >= 0 && currentW >= 0) return [(previousW + currentW) / 2 * hours / 1000, 0d]
+    if (previousW <= 0 && currentW <= 0) return [0d, -(previousW + currentW) / 2 * hours / 1000]
+    double zeroAt = previousW / (previousW - currentW)
+    double before = previousW / 2 * zeroAt * hours / 1000
+    double after = currentW / 2 * (1 - zeroAt) * hours / 1000
+    return [Math.max(before, 0d) + Math.max(after, 0d), -Math.min(before, 0d) - Math.min(after, 0d)]
+}
 
 private Double sumOf(List items, String key) {
     List vals = items.collect { it[key] }

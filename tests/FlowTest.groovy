@@ -24,6 +24,8 @@ import static Check.check
 @Field Map replay = [:]          // request key -> fixture answer
 @Field Closure override = null   // (call) -> FakeResp or null, to fake failures
 @Field List unknown = []         // requests the fixture has no answer for
+@Field int lastEnergyTicks = 0   // energy ticks in the last simulated day
+@Field List lastDay = []         // its requests
 
 // Script.setProperty writes to the binding; inside the checks' closures set the fields instead.
 void setProperty(String name, Object v) {
@@ -168,7 +170,7 @@ check("first tick: device values (com.solaredge's synthetic expectations)") {
     assert inv.healthStatus == "online"
     Map bat = values(child("battery"))
     assert bat.power == 500 && bat.battery == 62 && bat.chargingState == "charging"
-    assert bat.energyCharged == 1234.567 && bat.energyDischarged == 1000 && bat.residualEnergy == 6.2 && bat.stateOfHealth == 95
+    assert bat.energyCharged == 0 && bat.energyDischarged == 0 && bat.residualEnergy == 6.2 && bat.stateOfHealth == 95
     Map ev = values(child("ev-1000001479067354"))
     assert ev.power == 9509 && ev.switch == "on" && ev.chargingState == "plugged_in_charging" && ev.energyCharged == 127.456
     assert ev.sessionEnergy == 0.093 && ev.sessionDuration == 1 && ev.chargeMode == "manual" && ev.solarCharging == "off" && ev.vehicle == "Ioniq"
@@ -181,7 +183,7 @@ check("first tick: device values (com.solaredge's synthetic expectations)") {
 }
 
 check("first tick: each device's summary line, with units") {
-    assert child("battery").current.summary == "Charging 500 W · 62 % · 6.2 kWh left · charged 1,235 kWh · discharged 1,000 kWh · health 95 %"
+    assert child("battery").current.summary == "Charging 500 W · 62 % · 6.2 kWh left · charged 0.0 kWh · discharged 0.0 kWh · health 95 %"
     assert child("ev-1000001479067354").current.summary == "Charging 9.5 kW · session 0.1 kWh, 1 min · manual mode · Ioniq · 127 kWh charged in the past year"
     assert child("hlc-102").current.summary == "On (manual) · 2.0 kW (estimated)"
     assert child("meter").current.summary == "Exporting 1.2 kW to the grid · solar 5.6 kW · home 800 W · battery charging 500 W · this year imported 1,400 kWh, exported 2,700 kWh"
@@ -220,13 +222,53 @@ check("fast tick: only the power flow and the devices list, plus the next past m
 }
 
 check("unchanged values send no events; past years are not fetched again") {
+    // The battery charges at 500 W, so only its charged total moves.
     int before = app.getChildDevices().sum { it.events.size() }
     List calls = fastTick()
     assert calls.size() == 2
-    assert app.getChildDevices().sum { it.events.size() } == before
+    assert child("battery").events.last().name == "energyCharged"
+    assert app.getChildDevices().sum { it.events.size() } == before + 1, "the summary still reads 0.0 kWh: no event"
+    // 500 W for two 60 s polls since the first one
+    assert child("battery").current.energyCharged == 0.017
+}
+
+check("an energy tick that lands on a tick in flight still runs (state written back by its answers)") {
+    fresh()
+    install()
+    hub.clock += 300000
+    app.tick()                                    // the fast tick that lands on the energy tick
+    hub.settle()
+    Map loaded = new JsonSlurper().parseText(JsonOutput.toJson(app.state))
+    hub.clock += 500
+    app.energyTick()                              // finds that tick in flight
+    hub.settle()
+    // Its answers run in another execution, which loaded state before the energy tick and
+    // writes all of it back at the end (Hubitat keeps the last write).
+    app.state = loaded
+    serve()
+    assert app.callsNamed("runIn").last()[1] == 1 && app.callsNamed("runIn").last()[2] == "tick", "deferred energy tick runs straight after"
+    app.tick(); hub.settle()
+    List calls = serve()
+    assert gets(calls, "getBatteries") == 1 && gets(calls, "energyOverview") == 1
+}
+
+check("a fast tick due just before the energy tick is left to it") {
+    fresh()
+    install()
+    Map rt = app.runtime()
+    rt.nextEnergyAt = hub.clock + 70000
+    hub.clock += 60000
+    int sent = httpCalls().size()
+    app.tick()
+    assert httpCalls().size() == sent
+    hub.clock += 10000
+    app.energyTick(); hub.settle()
+    assert gets(serve(), "getBatteries") == 1
 }
 
 check("energy tick: energy and battery data; slow data only every third") {
+    fresh()
+    install()
     List counts = (1..3).collect {
         hub.clock += 300000
         app.energyTick()
@@ -253,32 +295,78 @@ int requestsPerDay(List picked) {
     app.tick(); hub.settle(); serve()
     fastTick()
     fastTick()
-    // Optimizer temperatures for any day: the fixture's.
+    // Optimizer temperatures for any day: the fixture's. The inverter uploads every
+    // 5 minutes at :28, as on a real site, so the energy tick settles just after it.
     Map byInverter = synth.calls.find { it.method == "getSiteEnergyByInverter" }.result
-    override = { call -> call[2].path?.contains("by-inverter") ? ok(byInverter) : null }
+    Map inverters = synth.calls.find { it.method == "getInvertersInformation" }.result
+    override = { call ->
+        if (call[2].path?.contains("by-inverter")) return ok(byInverter)
+        if (call[2].path?.contains("information/inverters")) {
+            long at = Math.floorDiv(hub.clock - 28000L, 300000L) * 300000L + 28000L
+            String iso = new Date(at).format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone("UTC"))
+            Map live = new JsonSlurper().parseText(JsonOutput.toJson(inverters))
+            live.serialToLiveData.values().each { it.lastMeasurement = iso }
+            return ok(live)
+        }
+        null
+    }
+    // Follow the app's own timers (the latest runIn/runInMillis of each wins, as on a hub).
+    // On a tie the fast tick goes first: the case that used to lose the energy tick.
+    long end = hub.clock + 24 * 3600 * 1000L
     int before = httpCalls().size()
-    (1..1440).each { int minute ->
-        hub.clock += 60000
-        if (minute % 5 == 0) app.energyTick() else app.tick()
+    int energyTicks = 0
+    while (true) {
+        List r = app.calls.findAll { it[0] == "runIn" && it[2] == "tick" }.last()
+        List e = app.calls.findAll { it[0] == "runInMillis" && it[2] == "energyTick" }.last()
+        long tickAt = (r[4] as long) + (r[1] as long) * 1000
+        long energyAt = (e[4] as long) + (e[1] as long)
+        long next = Math.min(tickAt, energyAt)
+        if (next > end) break
+        hub.clock = next
+        if (energyAt < tickAt) {
+            energyTicks++
+            app.energyTick()
+        } else {
+            app.tick()
+        }
         hub.settle()
         serve()
     }
     assert unknown == []
-    return httpCalls().size() - before
+    assert energyTicks in 288..289
+    lastEnergyTicks = energyTicks
+    lastDay = httpCalls().drop(before)
+    return lastDay.size()
 }
 
 check("requests per day, measured: inverter, meter and battery (60 s)") {
     int n = requestsPerDay(["inverter", "meter", "battery"])
-    println "    inverter + meter + battery: ${n} requests a day (com.solaredge 1.8.1: ~86,000)"
-    // 1440 power flows, 288 x (overview, inverters, batteries, this year), 96 x (by-inverter, communication, alerts)
-    assert n == 1440 + 288 * 4 + 96 * 3
+    int e = lastEnergyTicks
+    int slow = gets(lastDay, "alerts")
+    println "    inverter + meter + battery: ${n} requests a day, ${e} energy ticks (com.solaredge 1.8.1: ~86,000)"
+    // One power flow a minute, even with a fast tick landing on every energy tick;
+    // a couple more while the energy tick first moves to the inverter upload.
+    int flows = gets(lastDay, "powerflow")
+    assert flows in 1440..1444
+    // Every energy tick: overview, inverters, batteries, this year's meter totals.
+    ["energyOverview", "information/inverters", "getBatteries", "measurements"].each { assert gets(lastDay, it) == e, it }
+    // Every third: optimizer temperatures, site connectivity, alerts.
+    assert slow in [e.intdiv(3), e.intdiv(3) + 1]
+    ["by-inverter", "communication"].each { assert gets(lastDay, it) == slow, it }
+    assert n == flows + e * 4 + slow * 3
+    assert n < 2900
 }
 
 check("requests per day, measured: all five devices (60 s)") {
     int n = requestsPerDay(["inverter", "meter", "battery", "ev-1000001479067354", "hlc-102"])
+    int e = lastEnergyTicks
+    int slow = gets(lastDay, "alerts")
     println "    all five devices: ${n} requests a day"
     // plus a devices list every poll and the EV history on slow ticks
-    assert n == 1440 * 2 + 288 * 4 + 96 * 4
+    int flows = gets(lastDay, "powerflow")
+    assert flows in 1440..1444 && gets(lastDay, "v1.0/sites/") == flows
+    assert gets(lastDay, "applianceSessionsHistory") == slow
+    assert n == flows * 2 + e * 4 + slow * 4
 }
 
 // ---------------------------------------------------------------- overlap and retries

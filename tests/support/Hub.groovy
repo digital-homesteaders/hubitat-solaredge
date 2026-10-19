@@ -130,8 +130,9 @@ abstract class HubitatScript extends Script {
 
     // ---- time and scheduling
     long now() { hub?.clock ?: System.currentTimeMillis() }
-    void runIn(Number secs, String handler, Map opts = [:]) { calls << ["runIn", secs, handler, opts] }
-    void runInMillis(Number ms, String handler, Map opts = [:]) { calls << ["runInMillis", ms, handler, opts] }
+    // The time each timer was set comes last, for tests that follow the schedule.
+    void runIn(Number secs, String handler, Map opts = [:]) { calls << ["runIn", secs, handler, opts, now()] }
+    void runInMillis(Number ms, String handler, Map opts = [:]) { calls << ["runInMillis", ms, handler, opts, now()] }
     void runEvery30Minutes(String handler) { calls << ["runEvery30Minutes", handler] }
     void unschedule(String handler = null) { calls << ["unschedule", handler] }
     void unsubscribe() { calls << ["unsubscribe"] }

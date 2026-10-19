@@ -142,31 +142,59 @@ check("meter and battery: site not ONLINE while the inverters sleep is no alarm"
 
 // ---------------------------------------------------------------- battery
 
-check("battery: synthetic site (Wh energies)") {
+check("battery: synthetic site; charged/discharged start at 0 and come from power") {
     app.state.clear()
-    Map v = evs(app.batteryEvents("b1", fx("getSitePowerflow"), fx("getSiteBatteries"), fx("getSiteCommunication")))
+    Map v = evs(app.batteryEvents("b1", fx("getSitePowerflow"), fx("getSiteBatteries"), fx("getSiteCommunication"), false, captured))
     assert v.power == 500 && v.battery == 62 && v.chargingState == "charging"
-    assert v.energyCharged == 1234.567 && v.energyDischarged == 1000 && v.energy == 1000
+    // SolarEdge's chargeEnergy/dischargeEnergy (1234567 / 1000000 Wh here) are not used.
+    assert v.energyCharged == 0 && v.energyDischarged == 0 && v.energy == 0
     assert v.residualEnergy == 6.2 && v.stateOfHealth == 95
+}
+
+check("battery: real two-battery site (stored energy summed, health from the full pack)") {
+    app.state.clear()
+    Map resp = new JsonSlurper().parse(new File(root, "tests/fixtures/batteries-two.json")).response
+    Map v = evs(app.batteryEvents("b2", [storage: [currentPower: 0, status: "Idle", chargeLevel: 95]], resp, null, false, captured))
+    assert v.residualEnergy == 18.194 && v.stateOfHealth == 99
+    assert v.power == 0 && v.chargingState == "idle" && v.battery == 95
 }
 
 check("battery: kWh energies when the nameplate is below 100; discharging is negative") {
     app.state.clear()
-    Map bat = [chargeEnergy: 1234.5, dischargeEnergy: 1000, remainingEnergy: 6.2, fullPackEnergy: 9.2, namePlateEnergy: 9.7]
-    Map v = evs(app.batteryEvents("b2", [storage: [currentPower: 1.25, status: "DISCHARGING", chargeLevel: 40]], [devicesByType: [BATTERY: [bat]]]))
-    assert v.energyCharged == 1234.5 && v.residualEnergy == 6.2 && v.stateOfHealth == 95
+    Map bat = [remainingEnergy: 6.2, fullPackEnergy: 9.2, namePlateEnergy: 9.7]
+    Map v = evs(app.batteryEvents("b3", [storage: [currentPower: 1.25, status: "DISCHARGING", chargeLevel: 40]], [devicesByType: [BATTERY: [bat]]], null, false, captured))
+    assert v.residualEnergy == 6.2 && v.stateOfHealth == 95
     assert v.power == -1250 && v.chargingState == "discharging"
 }
 
-check("battery: a negative discharge counter (as seen live) is shown as an amount") {
+// [previous W, current W, charged kWh, discharged kWh] over one hour (the HA port's cases)
+[[1000, 1000, 1.0, 0.0], [0, 2000, 1.0, 0.0], [-1000, -3000, 0.0, 2.0], [0, 0, 0.0, 0.0],
+ [1000, -1000, 0.25, 0.25], [3000, -1000, 1.125, 0.125], [-1000, 3000, 1.125, 0.125]].each { List c ->
+    check("battery flow ${c[0]} W -> ${c[1]} W over an hour: ${c[2]} kWh charged, ${c[3]} discharged") {
+        List got = app.batteryFlowKwh(c[0] as double, c[1] as double, 3600d)
+        assert Math.abs((got[0] as double) - (c[2] as double)) < 1e-9 && Math.abs((got[1] as double) - (c[3] as double)) < 1e-9
+    }
+}
+
+check("battery flow: integrated per poll, not across a long gap, kept across restarts") {
     app.state.clear()
-    Map bat = [chargeEnergy: 0, dischargeEnergy: -9818, remainingEnergy: 7202, fullPackEnergy: 10000, namePlateEnergy: 9700]
-    Map v = evs(app.batteryEvents("b3", [storage: [currentPower: 10.0, status: "discharging", chargeLevel: 35]], [devicesByType: [BATTERY: [bat]]]))
-    assert v.energyDischarged == 9.818 && v.energy == 9.818 && v.energyCharged == 0
-    assert v.power == -10000 && v.residualEnergy == 7.202 && v.stateOfHealth == 100
-    // The counter state left by the old negative value doesn't hold the new one back.
-    app.state.counters = ["b4:discharged": [last: -9.818, offset: 0, falling: false]]
-    assert evs(app.batteryEvents("b4", null, [devicesByType: [BATTERY: [bat]]])).energyDischarged == 9.818
+    app.settings.pollSeconds = 60
+    long t = captured
+    Closure poll = { int w, long at -> evs(app.batteryEvents("bf", [storage: [currentPower: Math.abs(w) / 1000d, status: w < 0 ? "discharging" : w > 0 ? "charging" : "idle"]], null, null, false, at)) }
+    assert poll(-10000, t).energyDischarged == 0
+    // 10 kW out for one minute, then 2 kW in for one minute (crossing zero on the way)
+    assert poll(-10000, t + 60000).energyDischarged == 0.167
+    Map v = poll(2000, t + 120000)
+    assert v.energyCharged == 0.003 && v.energyDischarged == 0.236
+    // The totals are plain state, so they come through the hub's JSON (a restart).
+    hub.settle()
+    // A 15-minute gap (an outage) adds nothing; the next minute counts again.
+    assert poll(2000, t + 120000 + 15 * 60000).energyCharged == 0.003
+    assert poll(2000, t + 120000 + 16 * 60000).energyCharged == 0.036
+    // At a 300 s poll, three intervals (15 min) still count.
+    app.settings.pollSeconds = 300
+    assert poll(2000, t + 120000 + 31 * 60000).energyCharged == 0.536
+    app.settings.remove("pollSeconds")
 }
 
 check("counters never fall (com.solaredge devices.js sequence)") {

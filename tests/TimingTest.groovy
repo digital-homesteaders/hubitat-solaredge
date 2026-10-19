@@ -38,16 +38,17 @@ void snap(String serial, long at, long t) {
     hub.settle()
 }
 Map tm() { app.state.timing }
+Map rt() { app.runtime() }
 
 check("the energy tick follows the inverter and its margin adapts") {
-    app.state.timing = [phaseMs: 0, marginMs: MARGIN, snapshots: [:], judgePending: false]
+    app.state.timing = [phaseMs: 0, marginMs: MARGIN, snapshots: [:]]
     snap("INV1", at28, at28 + 32000)
     assert tm().phaseMs == 28000 + MARGIN
     assert app.callsNamed("runInMillis").last()[2] == "energyTick"
     assert app.callsNamed("runInMillis").last()[1] == app.delayToNextTick(at28 + 32000, 28000 + MARGIN)
 
     // Right after the energy tick the same upload says nothing: the next one isn't due.
-    app.state.timing.judgePending = true
+    rt().judgePending = true
     snap("INV1", at28, at28 + 50000)
     assert tm().marginMs == MARGIN
 
@@ -56,39 +57,40 @@ check("the energy tick follows the inverter and its margin adapts") {
     assert tm().marginMs == MARGIN + 15000 && tm().phaseMs == 28000 + MARGIN + 15000
 
     // The next tick finds a new one: the margin eases back.
-    app.state.timing.judgePending = true
+    rt().judgePending = true
     snap("INV1", at28 + PERIOD, at28 + PERIOD + 40000)
     assert tm().marginMs == MARGIN + 10000
 
     // A sleeping inverter (old upload) does not judge the tick.
-    app.state.timing.judgePending = true
+    rt().judgePending = true
     snap("INV1", at28 + PERIOD, at28 + 10 * PERIOD)
-    assert tm().marginMs == MARGIN + 10000 && tm().judgePending
+    assert tm().marginMs == MARGIN + 10000 && rt().judgePending
 }
 
 check("a site that uploads every 15 minutes: ticks between uploads don't judge") {
-    app.state.timing = [phaseMs: 0, marginMs: MARGIN, snapshots: [:], judgePending: false]
+    app.state.timing = [phaseMs: 0, marginMs: MARGIN, snapshots: [:]]
     snap("INV2", at28, at28 + MARGIN)
-    app.state.timing.judgePending = true
+    rt().judgePending = true
     snap("INV2", at28 + 3 * PERIOD, at28 + 3 * PERIOD + MARGIN)
     assert tm().cadenceMs == 3 * PERIOD
     [4, 5].each { int n ->
-        app.state.timing.judgePending = true
+        rt().judgePending = true
         snap("INV2", at28 + 3 * PERIOD, at28 + n * PERIOD + MARGIN)
     }
     assert tm().marginMs == MARGIN
     // The upload that was due is late: that does judge.
-    app.state.timing.judgePending = true
+    rt().judgePending = true
     snap("INV2", at28 + 3 * PERIOD, at28 + 6 * PERIOD + MARGIN)
     assert tm().marginMs == MARGIN + 15000
 }
 
 check("the energy tick marks itself for judging and schedules the next") {
-    app.state.timing = [phaseMs: 48000, marginMs: MARGIN, snapshots: [:], judgePending: false]
+    rt().remove("judgePending")
+    app.state.timing = [phaseMs: 48000, marginMs: MARGIN, snapshots: [:]]
     hub.clock = at28
     int before = app.callsNamed("runInMillis").size()
     app.energyTick()
-    assert app.state.timing.judgePending == true
+    assert rt().judgePending == true && rt().energyDue == true
     assert app.callsNamed("runInMillis").size() == before + 1
 }
 
