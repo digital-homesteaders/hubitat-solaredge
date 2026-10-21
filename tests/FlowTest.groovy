@@ -43,6 +43,8 @@ void fresh() {
     app.settings.username = USER
     app.settings.password = PASS
     answered = 0
+    tokenN = 0
+    codeN = 0
     override = null
     unknown = []
     replay = [:]
@@ -80,6 +82,31 @@ FakeResp loginOk() { new FakeResp(status: 302, data: "", headers: ["Set-Cookie":
 
 List httpCalls() { app.calls.findAll { it[0] in ["asynchttpGet", "asynchttpPost", "asynchttpPut"] } }
 
+// ---- a fake login.solaredge.com: authorize -> form -> form post -> token
+@Field String API = "https://monitoring.solaredge.com"
+@Field String LOGIN = "https://login.solaredge.com"
+@Field int tokenN = 0
+@Field int codeN = 0
+boolean onLogin(List c) { c[2].uri == LOGIN }
+boolean isAuthorize(List c) { c[0] == "asynchttpGet" && onLogin(c) && c[2].path == "/oauth2/authorize" }
+boolean isForm(List c) { c[0] == "asynchttpGet" && onLogin(c) && c[2].path == "/login" }
+boolean isFormPost(List c) { c[0] == "asynchttpPost" && onLogin(c) && c[2].path == "/login" }
+boolean isTokenPost(List c) { c[0] == "asynchttpPost" && onLogin(c) && c[2].path == "/oauth2/token" }
+boolean isRefresh(List c) { isTokenPost(c) && c[2].body.contains("grant_type=refresh_token") }
+/** Password logins (form posts) and token renewals so far. */
+int logins() { app.calls.count { isFormPost(it) } }
+int refreshes() { app.calls.count { isRefresh(it) } }
+String formPage() { '<form method="post"><input type="hidden" name="csrf" value="csrf-123"/><input name="username"/><input name="password" type="password"/></form>' }
+
+FakeResp loginServer(List call) {
+    if (isAuthorize(call)) return new FakeResp(status: 302, data: "", headers: ["Set-Cookie": "XSRF-TOKEN=x1; Path=/; Secure",
+        Location: "https://login.solaredge.com/login?client_id=ugfnsujd3384sshcjehaphlh3&redirect_uri=https%3A%2F%2Fmonitoring.solaredge.com%2Fmfe%2Fauth%2Fcallback&response_type=code"])
+    if (isForm(call)) return new FakeResp(status: 200, data: formPage(), headers: ["Set-Cookie": "login-session=s1; Path=/"])
+    if (isFormPost(call)) return new FakeResp(status: 302, data: "", headers: [Location: "https://monitoring.solaredge.com/mfe/auth/callback?code=code-${++codeN}"])
+    if (isTokenPost(call)) return ok([access_token: "at-${++tokenN}".toString(), refresh_token: "rt-1", expires_in: 3600, token_type: "Bearer"])
+    return null
+}
+
 /** Answer every HTTP call the app has made (at most `limit`), until it makes no more. Returns the calls answered. */
 List serve(int limit = Integer.MAX_VALUE) {
     List done = []
@@ -89,9 +116,9 @@ List serve(int limit = Integer.MAX_VALUE) {
         List call = all[answered++]
         done << call
         FakeResp resp = override?.call(call)
+        if (resp == null) resp = loginServer(call)
         if (resp == null) {
-            if (call[0] == "asynchttpPost") resp = loginOk()
-            else if (call[0] == "asynchttpPut") resp = ok([status: "PASSED"])
+            if (call[0] == "asynchttpPut") resp = ok([status: "PASSED"])
             else if (replay.containsKey(keyOf(call))) resp = ok(replay[keyOf(call)])
             else {
                 unknown << keyOf(call)
@@ -105,7 +132,7 @@ List serve(int limit = Integer.MAX_VALUE) {
 }
 
 /** Gets in a list of answered calls whose path contains `part`. */
-int gets(List calls, String part) { calls.count { it[0] == "asynchttpGet" && it[2].path.contains(part) } }
+int gets(List calls, String part) { calls.count { it[0] == "asynchttpGet" && (it[2].path ?: "").contains(part) } }
 
 FakeDevice child(String suffix) { app.getChildDevice("solaredge-${SITE}-${suffix}") }
 
@@ -140,7 +167,8 @@ check("discovery: one login, the sites, then per site power flow, devices and eq
     app.devicesPage()
     List calls = serve()
     assert unknown == []
-    assert calls.count { it[0] == "asynchttpPost" } == 1
+    assert calls.count { isAuthorize(it) } == 1 && calls.count { isForm(it) } == 1
+    assert calls.count { isFormPost(it) } == 1 && calls.count { isTokenPost(it) } == 1
     assert gets(calls, "so/sites/") == 1 && gets(calls, "powerflow") == 1 && gets(calls, "equipment") == 1
     assert app.state.discovered.size() == 5
     assert app.state.sites[SITE] == [name: "Synthetic site", tz: "Europe/Amsterdam", installYear: 2024, peakPower: 8, serials: "7E000000-00"]
@@ -335,7 +363,9 @@ int requestsPerDay(List picked) {
     assert unknown == []
     assert energyTicks in 288..289
     lastEnergyTicks = energyTicks
-    lastDay = httpCalls().drop(before)
+    // The hourly token renewals go to login.solaredge.com: the count is SolarEdge API requests.
+    lastDay = httpCalls().drop(before).findAll { it[2].uri == API }
+    assert httpCalls().drop(before).count { isRefresh(it) } in 23..25 && httpCalls().drop(before).count { isFormPost(it) } == 0
     return lastDay.size()
 }
 
@@ -393,28 +423,30 @@ check("a tick never overlaps the previous one") {
 check("401: log in again once and retry; a second 401 is an error, not a loop") {
     fresh()
     install()
-    int logins = app.callsNamed("asynchttpPost").size()
+    int logins0 = logins()
+    int refresh0 = refreshes()
     Set seen = [] as Set
-    override = { call -> call[0] == "asynchttpGet" && call[2].path.contains("powerflow") && seen.add(call[3].retried) && !call[3].retried ? new FakeResp(status: 401, data: "") : null }
+    override = { call -> call[0] == "asynchttpGet" && call[2].uri == API && call[2].path.contains("powerflow") && seen.add(call[3].retried) && !call[3].retried ? new FakeResp(status: 401, data: "") : null }
     List calls = fastTick()
-    assert app.callsNamed("asynchttpPost").size() == logins + 1
+    assert refreshes() == refresh0 + 1 && logins() == logins0, "renewed with the refresh token, no password"
     assert gets(calls, "powerflow") == 2
+    assert calls.findAll { it[2].uri == API }.last()[2].headers.Authorization == "Bearer at-2"
     assert child("inverter").current.healthStatus == "online"
 
-    override = { call -> call[0] == "asynchttpGet" ? new FakeResp(status: 401, data: "") : null }
+    // Every API call answers 401: one renewal, and its token never answers, so logins are held.
+    override = { call -> call[0] == "asynchttpGet" && call[2].uri == API ? new FakeResp(status: 401, data: "") : null }
     fastTick()
-    assert app.callsNamed("asynchttpPost").size() == logins + 2, "one more login for the tick, then errors, no loop"
-    // A session that dies right after login holds logins back: the next ticks don't log in.
-    Map rt = app.RUNTIME[app.app.id]
-    assert rt.loginRetryMs == 60000 && app.state.status.contains("new session")
+    assert refreshes() == refresh0 + 2 && logins() == logins0, "no loop"
+    Map rt = app.runtime()
+    assert rt.loginRetryMs == 60000 && app.state.status.contains("didn't accept the new login")
+    assert !app.atomicState.refreshToken, "a refresh token whose tokens don't work is dropped"
     hub.clock += 30000
     app.tick(); hub.settle(); serve()
-    assert app.callsNamed("asynchttpPost").size() == logins + 2
-    // After the block: one cycle (login, the 401, one re-login), then held for twice as long.
+    assert refreshes() == refresh0 + 2 && logins() == logins0
+    // After the hold: a password login (no refresh token left), then the 401: held twice as long.
     hub.clock = rt.loginBlockedUntil + 1
     app.tick(); hub.settle(); serve()
-    assert app.callsNamed("asynchttpPost").size() == logins + 4
-    assert rt.loginRetryMs == 120000
+    assert logins() == logins0 + 1 && rt.loginRetryMs == 120000
     // Working again: the backoff clears.
     override = null
     hub.clock = rt.loginBlockedUntil + 1
@@ -425,24 +457,26 @@ check("401: log in again once and retry; a second 401 is an error, not a loop") 
 check("an expired session that redirects to the login page counts as logged out") {
     fresh()
     install()
-    int logins = app.callsNamed("asynchttpPost").size()
+    int logins0 = logins()
+    int refresh0 = refreshes()
     boolean once = true
     override = { call ->
-        if (call[0] == "asynchttpGet" && call[2].path.contains("powerflow") && once) { once = false; return new FakeResp(status: 200, data: "<html><form><input name='j_password'></form></html>") }
+        if (call[0] == "asynchttpGet" && call[2].uri == API && call[2].path.contains("powerflow") && once) { once = false; return new FakeResp(status: 200, data: "<html><form>login</form></html>") }
         null
     }
     fastTick()
-    assert app.callsNamed("asynchttpPost").size() == logins + 1
+    assert refreshes() == refresh0 + 1 && logins() == logins0
     assert child("meter").current.healthStatus == "online"
 }
 
 check("rejected login: blocked 1 min, doubling up to 1 h, no login attempts while blocked") {
     fresh()
-    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 200, data: "<html><input name='j_password'></html>") : null }
+    // A wrong password: the form is served again.
+    override = { call -> isFormPost(call) ? new FakeResp(status: 200, data: formPage()) : null }
     app.mainPage()
     app.devicesPage()
     serve()
-    assert app.state.status.contains("rejected")
+    assert app.state.status.contains("rejected the e-mail or password")
     Map rt = app.RUNTIME[app.app.id]
     assert rt.loginRetryMs == 60000
     // Within the block: no login request.
@@ -450,7 +484,7 @@ check("rejected login: blocked 1 min, doubling up to 1 h, no login attempts whil
     app.state.discoveredAt = null
     app.devicesPage()
     serve()
-    assert app.callsNamed("asynchttpPost").size() == 1
+    assert logins() == 1
     List delays = []
     6.times {
         hub.clock = rt.loginBlockedUntil + 1
@@ -463,24 +497,86 @@ check("rejected login: blocked 1 min, doubling up to 1 h, no login attempts whil
     assert delays == [120000, 240000, 480000, 960000, 1920000, 3600000].collect { it as long }
 }
 
-check("a login redirected back to the login page is a rejection, not a session") {
+check("login: sent back to the form is a wrong password; any other answer is a refusal") {
     fresh()
-    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 302, data: "", headers: [
-        "Set-Cookie": new FakeHeaderEntry(name: "Set-Cookie", value: "JSESSIONID=abc; Path=/"),
-        "Location": new FakeHeaderEntry(name: "Location", value: "https://monitoring.solaredge.com/solaredge-web/p/login?error=true")]) : null }
+    override = { call -> isFormPost(call) ? new FakeResp(status: 302, data: "", headers: [
+        Location: new FakeHeaderEntry(name: "Location", value: "https://login.solaredge.com/login?client_id=x&error=true")]) : null }
     app.devicesPage()
     List calls = serve()
-    assert calls.count { it[0] == "asynchttpGet" } == 0
-    assert app.state.status.contains("rejected") && app.state.status.contains("login page")
-    assert app.RUNTIME[app.app.id].loginRetryMs == 60000
-    // A 302 to the portal is a good login.
+    assert calls.count { it[0] == "asynchttpGet" && it[2].uri == API } == 0
+    assert app.state.status.contains("rejected the e-mail or password")
+    assert app.runtime().loginRetryMs == 60000
+    // A retired endpoint (410, as the old login does now) or a second factor: refused, not a wrong password.
+    [new FakeResp(status: 410, data: ""), new FakeResp(status: 302, data: "", headers: [Location: "https://login.solaredge.com/mfa?x=1"])].each { FakeResp r ->
+        fresh()
+        override = { call -> isFormPost(call) ? r : null }
+        app.devicesPage()
+        serve()
+        assert app.state.status.startsWith("SolarEdge refused the login: the login answered HTTP ${r.status}")
+        assert !app.state.status.contains("password")
+        assert app.runtime().loginRetryMs == 60000
+    }
+    // The start answering 410 without a redirect: refused too.
     fresh()
-    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 302, data: "", headers: [
-        "Set-Cookie": new FakeHeaderEntry(name: "Set-Cookie", value: "JSESSIONID=abc; Path=/"),
-        "Location": new FakeHeaderEntry(name: "Location", value: "https://monitoring.solaredge.com/solaredge-web/p/home")]) : null }
+    override = { call -> isAuthorize(call) ? new FakeResp(status: 410, data: "") : null }
+    app.devicesPage()
+    serve()
+    assert app.state.status.contains("refused the login: the login start answered HTTP 410")
+    // A redirect with a code is a login.
+    fresh()
     app.devicesPage()
     serve()
     assert app.state.discovered.size() == 5
+}
+
+check("login: PKCE challenge (RFC 7636), the form's csrf and cookies, the code for tokens") {
+    // The example of RFC 7636 appendix B.
+    assert app.pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    fresh()
+    app.devicesPage()
+    List calls = serve()
+    Map auth = calls.find { isAuthorize(it) }[2]
+    assert auth.followRedirects == false && auth.query.client_id == "ugfnsujd3384sshcjehaphlh3" && auth.query.code_challenge_method == "S256"
+    assert auth.query.redirect_uri == "https://monitoring.solaredge.com/mfe/auth/callback"
+    Map form = calls.find { isForm(it) }[2]
+    assert form.query.client_id == "ugfnsujd3384sshcjehaphlh3" && form.headers.Cookie == "XSRF-TOKEN=x1"
+    Map post = calls.find { isFormPost(it) }[2]
+    assert post.followRedirects == false && post.headers.Cookie == "XSRF-TOKEN=x1; login-session=s1"
+    assert post.body == "csrf=csrf-123&username=${URLEncoder.encode(USER, 'UTF-8')}&password=${URLEncoder.encode(PASS, 'UTF-8')}&cognitoAsfData="
+    Map token = calls.find { isTokenPost(it) }[2]
+    Map fields = token.body.split("&").collectEntries { String kv -> kv.split("=", 2).collect { URLDecoder.decode(it, "UTF-8") } }
+    assert fields.client_id == "ugfnsujd3384sshcjehaphlh3" && fields.grant_type == "authorization_code" && fields.code == "code-1"
+    assert app.pkceChallenge(fields.code_verifier) == auth.query.code_challenge && fields.code_verifier.length() >= 43
+    // API calls carry the token, no cookies.
+    calls.findAll { it[2].uri == API }.each { assert it[2].headers.Authorization == "Bearer at-1" && !it[2].headers.Cookie }
+    assert app.atomicState.refreshToken == "rt-1"
+}
+
+check("token: renewed with the refresh token before it expires; a dead refresh token falls back to the password") {
+    fresh()
+    install()
+    int logins0 = logins()
+    hub.clock += 59 * 60000L                    // the token (3600 s) is renewed a minute early
+    List calls = fastTick()
+    assert refreshes() == 1 && logins() == logins0
+    assert calls.findAll { it[2].uri == API }.every { it[2].headers.Authorization == "Bearer at-2" }
+    // The refresh token is no longer accepted: one password login, then on as usual.
+    override = { call -> isRefresh(call) ? new FakeResp(status: 400, data: JsonOutput.toJson([error: "invalid_grant"])) : null }
+    hub.clock += 60 * 60000L
+    calls = fastTick()
+    assert logins() == logins0 + 1 && gets(calls, "powerflow") == 1
+    assert child("inverter").current.healthStatus == "online"
+    // Saving new app code or a hub restart loses the access token, not the refresh token.
+    app.runtime().remove("token")
+    override = null
+    fastTick()
+    assert logins() == logins0 + 1 && refreshes() == 3
+}
+
+check("splitUrl: absolute and relative Locations, query decoded") {
+    assert app.splitUrl("https://login.solaredge.com/login?a=1&b=x%2Fy", "https://z") == [origin: "https://login.solaredge.com", path: "/login", query: [a: "1", b: "x/y"]]
+    assert app.splitUrl("/mfa", "https://login.solaredge.com") == [origin: "https://login.solaredge.com", path: "/mfa", query: [:]]
+    assert app.splitUrl("https://monitoring.solaredge.com/mfe/auth/callback?code=abc%3D&state=s", "x").query.code == "abc="
 }
 
 check("Done in the app retries at once after a held login or an outage pause") {
@@ -488,30 +584,36 @@ check("Done in the app retries at once after a held login or an outage pause") {
     install()
     Map rt = app.runtime()
     // Logins held after a failure, and polls paused after an outage.
-    rt.cookies = []
+    rt.remove("token")
     rt.loginRetryMs = 240000L
     rt.loginBlockedUntil = hub.clock + 240000L
     rt.backoffUntil = hub.clock + 600000L
     hub.clock += 60000
     app.tick(); hub.settle()
     assert serve() == []
-    int logins = app.callsNamed("asynchttpPost").size()
+    int refresh0 = refreshes()
     app.updated(); hub.settle()                  // the user presses Done, same credentials
     app.tick(); hub.settle()
     List calls = serve()
-    assert app.callsNamed("asynchttpPost").size() == logins + 1 && gets(calls, "powerflow") == 1
+    assert refreshes() == refresh0 + 1 && gets(calls, "powerflow") == 1
     assert rt.loginRetryMs == 0 && rt.backoffUntil == 0
     assert child("inverter").current.healthStatus == "online"
 }
 
 check("a login that fails on SolarEdge's side is an outage, not a rejection") {
     fresh()
-    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 503, data: "") : null }
+    // No answer at all: an outage, logins not held.
+    override = { call -> onLogin(call) ? new FakeResp(status: 0, data: null, errorMessage: "connect timed out") : null }
     app.devicesPage()
     serve()
-    Map rt = app.RUNTIME[app.app.id]
-    assert !rt.loginRetryMs
+    assert !app.runtime().loginRetryMs
     assert app.state.status.contains("unavailable")
+    // A server error: also held back (a locked account answers 500, and logging in on keeps it locked).
+    fresh()
+    override = { call -> isFormPost(call) ? new FakeResp(status: 503, data: "") : null }
+    app.devicesPage()
+    serve()
+    assert app.runtime().loginRetryMs == 60000 && app.state.status.contains("unavailable") && !app.state.status.contains("password")
 }
 
 check("outage: back off, doubling, and devices offline only after 3 failed ticks") {
@@ -654,7 +756,7 @@ check("requests waiting for a login: same URL from two callers, both answered") 
     fresh()
     install()
     Map rt = app.RUNTIME[app.app.id]
-    rt.cookies = []
+    rt.remove("token")
     FakeDevice ev = child("ev-1000001479067354")
     ev.on()
     ev.off()
@@ -664,7 +766,7 @@ check("requests waiting for a login: same URL from two callers, both answered") 
     assert puts.size() == 2
     assert puts.collect { new JsonSlurper().parseText(it[2].body).level } == [100, 0]
     // A discovery and a tick both waiting for the power flow.
-    rt.cookies = []
+    rt.remove("token")
     app.state.discoveredAt = null
     app.devicesPage()
     hub.clock += 60000
@@ -705,7 +807,7 @@ check("a tick is only given up on after the longest legitimate chain") {
 check("discovery restarted while the old one is out: old answers are ignored") {
     fresh()
     app.devicesPage()
-    serve(2)                                // login + sites; the three per-site calls are now out
+    serve(5)                                // login (4 steps) + sites; the three per-site calls are now out
     int oldEnd = httpCalls().size()
     assert app.state.discovering && oldEnd - answered == 3
     hub.clock += 100000                     // the page gives up and starts again
@@ -899,8 +1001,9 @@ check("solar forecast: hourly from Forecast.Solar, on the inverter and its summa
 check("a rejected login is one warning, not one per request") {
     fresh()
     install()
-    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 200, data: "<html><input name='j_password'></html>") : null }
-    app.runtime().cookies = []
+    override = { call -> isFormPost(call) ? new FakeResp(status: 200, data: formPage()) : null }
+    app.runtime().remove("token")
+    app.atomicState.remove("refreshToken")
     fastTick()
     List warns = app.log.at("warn")
     assert warns.count { it.contains("rejected") } == 1
@@ -975,9 +1078,10 @@ check("credentials: only in the app's settings; never in logs, state or device d
         assert !d.data.values().any { it?.contains(PASS) || it?.contains(USER) }
         assert !d.driver.settings.values().any { it?.toString()?.contains(PASS) }
     }
-    // The login body carries them, nothing else does.
-    assert app.callsNamed("asynchttpPost").every { it[2].body.contains("j_password=") }
-    assert app.callsNamed("asynchttpGet").every { !JsonOutput.toJson(it[2]).contains(PASS) }
+    // The login form post carries them, nothing else does; no token or code is logged.
+    List withPass = httpCalls().findAll { JsonOutput.toJson(it[2]).contains(URLEncoder.encode(PASS, "UTF-8")) || JsonOutput.toJson(it[2]).contains(PASS) }
+    assert withPass && withPass.every { isFormPost(it) }
+    assert !texts.any { it.contains("rt-1") || it =~ /at-\d/ || it.contains("code-1") || it.contains("csrf-123") }
 }
 
 check("state stays small: no response bodies") {
@@ -988,10 +1092,10 @@ check("state stays small: no response bodies") {
 
 check("new credentials drop the session") {
     Map rt = app.RUNTIME[app.app.id]
-    assert rt.cookies
+    assert rt.token && app.atomicState.refreshToken
     app.settings.password = "changed"
     app.updated()
-    assert !rt.cookies
+    assert !rt.token && !app.atomicState.refreshToken
 }
 
 check("cookies: several in one header, Expires dates kept whole") {
@@ -1014,17 +1118,21 @@ check("cookies: Hubitat's HeaderEntry values (as seen on a hub)") {
     assert app.cookiesOf(listed) == [id]
 }
 
-check("login with a HeaderEntry cookie logs in and the tick goes out") {
+check("login with Hubitat HeaderEntry headers (as seen on a hub)") {
     fresh()
-    FakeHeaderEntry entry = new FakeHeaderEntry(name: "Set-Cookie", value: "JSESSIONID=abc; Path=/solaredge-apigw; Secure; HttpOnly")
-    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 302, data: "", headers: ["Set-Cookie": entry]) : null }
+    override = { call ->
+        if (!isAuthorize(call)) return null
+        new FakeResp(status: 302, data: "", headers: [
+            "Set-Cookie": new FakeHeaderEntry(name: "Set-Cookie", value: "JSESSIONID=abc; Path=/; Secure; HttpOnly"),
+            Location: new FakeHeaderEntry(name: "Location", value: "https://login.solaredge.com/login?client_id=ugfnsujd3384sshcjehaphlh3")])
+    }
     app.mainPage()
     app.devicesPage()
-    serve()
+    List calls = serve()
+    assert calls.find { isForm(it) }[2].headers.Cookie == "JSESSIONID=abc"
     assert app.state.status == "Logged in"
     assert app.state.discovered.size() == 5
-    assert app.RUNTIME[app.app.id].cookies == ["JSESSIONID=abc"]
-    assert app.callsNamed("asynchttpGet").every { it[2].headers.Cookie == "JSESSIONID=abc" }
+    assert app.runtime().token == "at-1"
 }
 
 Check.finish()

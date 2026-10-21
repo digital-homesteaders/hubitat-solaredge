@@ -100,6 +100,8 @@ abstract class HubitatScript extends Script {
         else super.setProperty(name, v)
     }
 
+    // atomicState is written at once on a hub; here it is the same map as state.
+    Map getAtomicState() { state }
     Map getLocation() { [temperatureScale: hub?.temperatureScale ?: "F", timeZone: TimeZone.getDefault(), latitude: 52.3731339, longitude: 4.8903147] }
 
     // Settings are readable as bare names when declared with input.

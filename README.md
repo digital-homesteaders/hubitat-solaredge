@@ -12,10 +12,22 @@ load controllers (smart relays).
 
 ## How it works
 
-SolarEdge Connect logs in to **monitoring.solaredge.com** with your mySolarEdge
-e-mail and password, the same way the mySolarEdge phone app does. This is
-SolarEdge's private app API, not the public Monitoring API, so you don't need
-an API key. It also means SolarEdge can change it without notice.
+SolarEdge Connect logs in with your mySolarEdge e-mail and password the way
+SolarEdge's web portal does, then reads **monitoring.solaredge.com**, the
+private API behind the mySolarEdge app. You don't need an API key, because
+this isn't the public Monitoring API. It also means SolarEdge can change it
+without notice, and it did on 2026-10-21, when the old login started
+answering "410 Gone":
+
+- **Login:** OAuth2 with PKCE on **login.solaredge.com**. The app opens the
+  login form, posts your e-mail and password to it, and exchanges the code it
+  gets back for an access token and a refresh token.
+- **Requests:** every API call carries the access token.
+- **Renewal:** the access token lasts about an hour, and the app renews it
+  with the refresh token, so the password isn't sent again. The refresh token
+  is kept in the app's state, so it also survives saving new code or
+  restarting the hub. Only when it stops working does the app log in with the
+  password again.
 
 - **SolarEdge Connect** (app) holds the account, one login session and one
   poll timer. It finds the sites and devices on the account and creates one
@@ -69,13 +81,15 @@ These come from a review of the Homey app (1.8.1, and the 2.0.0 rewrite):
    Identical requests in a tick are merged, so the power flow is fetched once
    per site.
 3. **Outages:** after an outage or an HTTP 429 the app pauses polling for
-   twice the poll interval, doubling up to 30 minutes. A rejected login is
-   kept apart from a SolarEdge or network error, and a login that SolarEdge
-   redirects back to its login page counts as a rejection. After a
-   rejection, logins are held back for 1 minute, doubling up to 1 hour. On a
-   401 or a redirect to the login page the app logs in again once and
-   retries. If the new session is turned away as well, logins are held back
-   the same way, so a broken session can't cause a login on every poll.
+   twice the poll interval, doubling up to 30 minutes. A wrong password (the
+   login form served again) is kept apart from a SolarEdge or network error
+   and from any other unexpected answer, which the app reports as "refused",
+   not as a wrong password. After either, logins are held back for 1 minute,
+   doubling up to 1 hour; a server error at login is held back too, since a
+   locked account answers 500. On a 401 the app renews the token once and
+   retries. If the new token is turned away as well, logins are held back the
+   same way, so a broken login can't cause a login on every poll. **Done** in
+   the app clears the hold and retries at once.
 4. **Night:** the inverter never goes offline at night or while idle. It
    shows 0 W and `inverterStatus` becomes `sleeping`. While the inverters
    sleep, no device reports the site offline. Devices show
@@ -286,9 +300,16 @@ Hubitat runs) against small stand-ins for the hub, then runs:
     per tick, per energy or slow tick and over a simulated day, the meter's
     past years (including a year missed over New Year), and events only on
     change
-  - 401 and expired-session retries, a new session turned away at once,
-    rejected-login backoff (1 min to 1 h), a login redirected back to the
-    login page, and the difference between a login outage and a rejection
+  - the OAuth login step by step:
+    - the PKCE challenge, checked against the RFC 7636 example
+    - the form's csrf value and the cookies carried between steps
+    - the code exchanged for tokens, and a Bearer token on every API call
+  - token renewal before expiry and on a 401, and a dead refresh token
+    falling back to the password
+  - a new token turned away at once
+  - a wrong password versus a refused login (410, a second factor), with
+    their backoff (1 min to 1 h)
+  - a login outage versus a server error
   - requests waiting for a login (same URL from two callers, commands kept
     in order), commands answered 204, and the stale-tick limit
   - outage and 429 backoff, and `healthStatus` going offline after 3 failed
@@ -317,13 +338,18 @@ itself still needs checking.
 1. The app and drivers save in Apps Code and Drivers Code. The local compile
    uses the same Groovy, but not Hubitat's sandbox (`ConcurrentHashMap` in a
    `@Field static`, `SimpleDateFormat`).
-2. **Login**: whether `asynchttpPost` honours `followRedirects: false` and
-   returns SolarEdge's 302 with all its `Set-Cookie` headers. If it follows
-   the redirect, the app accepts a 200 with cookies and no login form. That
-   needs checking against the real site, together with the 1-minute backoff
-   after a wrong password.
-3. Session expiry: that a 401, or a redirect to the login page, leads to one
-   new login.
+2. **Login (OAuth, new on 2026-10-21):** check the whole flow on a real hub:
+   - that `asynchttpGet` and `asynchttpPost` honour `followRedirects: false`
+     on login.solaredge.com, with the Location and Set-Cookie headers the
+     steps need
+   - that the form's `csrf` value is found in the page as Hubitat returns it
+   - that the token answer arrives as JSON
+   - the 1-minute hold after a wrong password
+
+   The tests run the flow against a fake login.solaredge.com modelled on
+   com.solaredge v2.1.1.
+3. Token renewal: that a 401, or the hourly expiry, leads to one renewal with
+   the refresh token and no password login.
 4. **Choose devices** page: the auto-refresh during discovery, and how it
    looks.
 5. Real answers from your own site: inverter, meter, and battery if you
@@ -347,6 +373,7 @@ itself still needs checking.
 GNU General Public License v3.0 or later; see [LICENSE](LICENSE).
 
 A port of [com.solaredge](https://github.com/gruijter/com.solaredge) v2.0.0
+(the OAuth login from v2.1.1)
 for Homey by **Robin de Gruijter**, itself based on the original app by Emile
 Nijssen (Athom). The SolarEdge cloud client, the energy-tick timing, the
 device mappings and the test fixtures come from that project (GPL-3.0).

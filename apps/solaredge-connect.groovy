@@ -14,8 +14,8 @@
  * All SolarEdge mapping lives in this file as plain functions of the API
  * answers, so the device drivers stay thin.
  *
- * Ported from com.solaredge v2.0.0 for Homey by Robin de Gruijter
- * (https://github.com/gruijter/com.solaredge), itself based on the app by
+ * Ported from com.solaredge v2.0.0 for Homey by Robin de Gruijter (the OAuth
+ * login from v2.1.1; https://github.com/gruijter/com.solaredge), itself based on the app by
  * Emile Nijssen (Athom). Changes for Hubitat: see README.md.
  *
  * Copyright (C) 2026 Robin de Gruijter (original), 2026 Digital Homesteaders (Hubitat port)
@@ -52,7 +52,12 @@ preferences {
 // ---------------------------------------------------------------- constants
 
 @Field static final String BASE_URL = "https://monitoring.solaredge.com"
-@Field static final String LOGIN_PATH = "/solaredge-apigw/api/login"
+// Login: the web portal's OAuth2 PKCE flow on login.solaredge.com (the old
+// solaredge-apigw form login answers 410 Gone since 2026-10-21). The client id is the
+// portal's public one, not a secret (com.solaredge v2.1.0).
+@Field static final String LOGIN_URL = "https://login.solaredge.com"
+@Field static final String OAUTH_CLIENT_ID = "ugfnsujd3384sshcjehaphlh3"
+@Field static final String REDIRECT_URI = "https://monitoring.solaredge.com/mfe/auth/callback"
 // The mySolarEdge iOS app's headers.
 @Field static final Map API_HEADERS = ["User-Agent": "SolarEdge/14 CFNetwork/1568.200.51 Darwin/24.1.0", "CLIENT-VERSION": "3.12", "Accept": "application/json"]
 
@@ -140,7 +145,7 @@ preferences {
     auto: [mode: "AUTO", level: null, duration: null],
 ]
 
-// Per app instance, in memory only: the session cookies, login and backoff
+// Per app instance, in memory only: the access token, login and backoff
 // bookkeeping, and the tick in flight with its answers. Lost on a hub reboot,
 // which costs one login. Nothing here goes into state, so no response bodies
 // and no session are stored.
@@ -253,7 +258,8 @@ void initialize() {
     String credKey = credentialsKey()
     if (rt.credKey != credKey) {
         rt.credKey = credKey
-        rt.cookies = []
+        rt.remove("token")
+        atomicState.remove("refreshToken")
     }
     // Done in the app retries now: no login hold or outage pause carries over (the
     // status after a failure says so).
@@ -324,7 +330,7 @@ private String credentialsKey() { "${settings.username}\n${settings.password}".h
 private Map runtime() {
     Map rt = RUNTIME[app.id]
     if (rt == null) {
-        rt = new ConcurrentHashMap([cookies: [], loginBlockedUntil: 0L, loginRetryMs: 0L, backoffUntil: 0L, outages: 0,
+        rt = new ConcurrentHashMap([loginBlockedUntil: 0L, loginRetryMs: 0L, backoffUntil: 0L, outages: 0,
             waiting: new ConcurrentHashMap(), loggedOnce: new ConcurrentHashMap(), credKey: credentialsKey()])
         RUNTIME[app.id] = rt
     }
@@ -414,7 +420,7 @@ private Map apiGet(String path, Map query = [:]) {
  */
 private void send(Map req) {
     Map rt = runtime()
-    if (!rt.cookies) {
+    if (!hasToken()) {
         // One entry per request, so two callers of the same URL both get their answer;
         // `seq` keeps them in order (an "on" then "off" must go out in that order).
         long seq = ((rt.seq ?: 0L) as long) + 1
@@ -423,12 +429,12 @@ private void send(Map req) {
         startLogin()
         return
     }
-    Map params = [uri: BASE_URL, path: req.path, headers: API_HEADERS + [Cookie: rt.cookies.join("; ")],
+    Map params = [uri: BASE_URL, path: req.path, headers: API_HEADERS + [Authorization: "Bearer ${rt.token}".toString()],
         contentType: "application/json", timeout: REQUEST_TIMEOUT]
     if (req.query) params.query = req.query
     // Everything a retry needs travels with the callback; `gen` is the session it went out on.
     Map data = [key: req.key, method: req.method, path: req.path, query: req.query, body: req.body, cb: req.cb, ctx: req.ctx,
-        retried: req.retried ?: false, gen: rt.cookieGen]
+        retried: req.retried ?: false, gen: rt.tokenGen]
     logDebug "${req.method} ${req.path}"
     if (req.method == "PUT") {
         params.requestContentType = "application/json"
@@ -445,28 +451,36 @@ def requestDone(resp, Map data) {
     int status = statusOf(resp)
     String body = bodyOf(resp)
     def json = parseJsonText(body)
-    // An expired session answers 401, or redirects to the login page (followed or not).
+    // An expired token answers 401 (a redirect to a login page counts the same).
     boolean loggedOut = status == 401 || (status >= 300 && status < 400) || (status == 200 && json == null && looksLikeLogin(body))
     if (loggedOut) {
-        // Only this session expired: a login since this request went out stays.
-        boolean sameSession = rt.cookieGen == data.gen && rt.cookies
-        if (sameSession) rt.cookies = []
+        // Only this token expired: a renewal since this request went out stays.
+        boolean sameToken = rt.tokenGen == data.gen && rt.token
+        if (sameToken) {
+            rt.remove("token")
+            // A token that never answered: the login didn't really work. Hold logins back,
+            // or it would log in on every poll. Once per token (the others see it cleared).
+            if (rt.confirmedGen != data.gen) {
+                atomicState.remove("refreshToken")
+                holdLogins("SolarEdge didn't accept the new login (HTTP ${status})")
+                deliver(req, [error: "Unauthorized", status: status, outage: false, login: true])
+                return
+            }
+        }
         if (!data.retried) {
-            logDebug "${data.path}: session expired, logging in again"
+            logDebug "${data.path}: token expired, renewing"
             req.retried = true
             send(req)
             return
         }
-        // Logged out again right after a fresh login: the login didn't really work
-        // (or its cookies don't). Hold logins back as after a rejection.
-        // Once per session: the other requests of that session fail the same way.
-        if (sameSession) holdLogins("SolarEdge didn't accept the new session (HTTP ${status})")
         deliver(req, [error: "Unauthorized", status: status, outage: false])
         return
     }
     // A command may answer 2xx with no JSON body (e.g. 204).
     if (status >= 200 && status < 300 && (json != null || data.method == "PUT")) {
         if (json == null) json = [:]
+        // The token has answered: the login worked.
+        if (data.gen == rt.tokenGen) rt.confirmedGen = data.gen
         rt.loginRetryMs = 0L
         rt.loginBlockedUntil = 0L
         deliver(req, [json: json])
@@ -513,6 +527,17 @@ private def parseJsonText(String s) {
 
 // ---------------------------------------------------------------- login
 
+/** Whether there is an access token that hasn't expired. */
+private boolean hasToken() {
+    Map rt = runtime()
+    return rt.token && now() < ((rt.tokenExpiresAt ?: 0L) as long)
+}
+
+/**
+ * Get an access token for the waiting requests: from the refresh token when there
+ * is one (no password sent), else by logging in (loginAuthorize). One at a time;
+ * held back for a while after a login that wasn't accepted.
+ */
 private void startLogin() {
     Map rt = runtime()
     if (!settings.username || !settings.password) {
@@ -521,51 +546,202 @@ private void startLogin() {
         return
     }
     if (now() < (rt.loginBlockedUntil as long)) {
-        failWaiting("Invalid e-mail and/or password", false)
+        failWaiting(rt.loginBlockedWhy ?: "Login held back after a failure", false)
         return
     }
     if (rt.putIfAbsent("loggingIn", true) != null) return
-    String body = "j_username=${URLEncoder.encode(settings.username as String, 'UTF-8')}&j_password=${URLEncoder.encode(settings.password as String, 'UTF-8')}"
-    Map params = [uri: BASE_URL, path: LOGIN_PATH, headers: ["User-Agent": API_HEADERS["User-Agent"]],
-        requestContentType: "application/x-www-form-urlencoded", contentType: "text/html",
-        body: body, timeout: REQUEST_TIMEOUT, followRedirects: false]
-    // Never log the body or the credentials.
-    logDebug "Logging in"
-    asynchttpPost("loginDone", params, [:])
+    String refresh = atomicState.refreshToken
+    if (refresh) {
+        logDebug "Renewing the access token"
+        tokenRequest("refresh_token=${enc(refresh)}", "refresh")
+        return
+    }
+    loginAuthorize()
 }
 
-def loginDone(resp, Map data) {
+/** Step 1: the authorize endpoint, with a PKCE challenge; it redirects to the login form. */
+private void loginAuthorize() {
+    Map rt = runtime()
+    // PKCE verifier: 64 random characters (two random UUIDs, as hex); the challenge is
+    // its SHA-256, base64url without padding.
+    String verifier = (UUID.randomUUID().toString() + UUID.randomUUID().toString()).replace("-", "")
+    rt.login = new ConcurrentHashMap([verifier: verifier, jar: new ConcurrentHashMap()])
+    logDebug "Logging in"
+    loginGet(LOGIN_URL, "/oauth2/authorize", [client_id: OAUTH_CLIENT_ID, response_type: "code", redirect_uri: REDIRECT_URI,
+        code_challenge: pkceChallenge(verifier), code_challenge_method: "S256"], "loginAuthorizeDone")
+}
+
+/** base64url (no padding) of the SHA-256 of the verifier, as RFC 7636 S256 wants. */
+String pkceChallenge(String verifier) {
+    byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(verifier.getBytes("US-ASCII"))
+    return digest.encodeBase64().toString().replace("+", "-").replace("/", "_").replaceAll("=+\$", "")
+}
+
+def loginAuthorizeDone(resp, Map data) {
+    if (loginStepFailed(resp, "authorize")) return
+    String location = headerOf(resp, "Location")
+    if (!location) {
+        loginRefused("the login start answered HTTP ${statusOf(resp)} without a redirect")
+        return
+    }
+    Map u = splitUrl(location, LOGIN_URL)
+    runtime().login.form = u
+    loginGet(u.origin, u.path, u.query, "loginFormDone")
+}
+
+/** Step 2: the login form, for its csrf value. */
+def loginFormDone(resp, Map data) {
+    if (loginStepFailed(resp, "login page")) return
+    def m = (bodyOf(resp) ?: "") =~ /name="csrf" value="([^"]*)"/
+    if (statusOf(resp) != 200 || !m.find()) {
+        loginRefused("the login page answered HTTP ${statusOf(resp)} without its form")
+        return
+    }
+    Map login = runtime().login
+    Map form = login.form
+    // Step 3: post the credentials to the form's own address (never logged).
+    String body = "csrf=${enc(m.group(1))}&username=${enc(settings.username as String)}&password=${enc(settings.password as String)}&cognitoAsfData="
+    Map params = [uri: form.origin, path: form.path, headers: [Cookie: jarHeader(login.jar)],
+        requestContentType: "application/x-www-form-urlencoded", contentType: "text/plain", body: body,
+        timeout: REQUEST_TIMEOUT, followRedirects: false]
+    if (form.query) params.query = form.query
+    asynchttpPost("loginPostDone", params, [:])
+}
+
+/** The form answers with a redirect to the portal's callback, carrying the code. */
+def loginPostDone(resp, Map data) {
+    if (loginStepFailed(resp, "login")) return
+    int status = statusOf(resp)
+    Map login = runtime().login
+    String location = headerOf(resp, "Location")
+    Map next = location ? splitUrl(location, login.form.origin as String) : null
+    String code = next?.query?.code
+    if (!code) {
+        // The form served again (or a redirect back to it) is a wrong password; anything
+        // else (a second factor, a retired endpoint) must not read as one.
+        if (next ? next.path == login.form.path : status == 200) {
+            holdLogins("SolarEdge rejected the e-mail or password")
+            loginOver()
+            failWaiting("Invalid e-mail and/or password", false, status)
+        } else {
+            loginRefused("the login answered HTTP ${status}${next ? ' to ' + next.origin + next.path : ''}")
+        }
+        return
+    }
+    // Step 4: the code for the tokens.
+    tokenRequest("grant_type=authorization_code&code=${enc(code)}&redirect_uri=${enc(REDIRECT_URI)}&code_verifier=${enc(login.verifier as String)}", "code")
+}
+
+private void tokenRequest(String grant, String kind) {
+    String body = grant.startsWith("refresh_token=") ? "grant_type=refresh_token&${grant}" : grant
+    asynchttpPost("tokenDone", [uri: LOGIN_URL, path: "/oauth2/token", headers: [Accept: "application/json"],
+        requestContentType: "application/x-www-form-urlencoded", contentType: "application/json",
+        body: "client_id=${OAUTH_CLIENT_ID}&${body}".toString(), timeout: REQUEST_TIMEOUT], [kind: kind])
+}
+
+def tokenDone(resp, Map data) {
+    Map rt = runtime()
+    int status = statusOf(resp)
+    def json = parseJsonText(bodyOf(resp))
+    if (status == 200 && json instanceof Map && json.access_token) {
+        rt.token = json.access_token as String
+        rt.tokenGen = ((rt.tokenGen ?: 0) as int) + 1
+        // Renewed a minute early, so no request goes out with a token about to expire.
+        rt.tokenExpiresAt = now() + (((json.expires_in instanceof Number ? json.expires_in : 3600) as long) - 60) * 1000L
+        // A refresh answers without a new refresh token: the old one stays.
+        if (json.refresh_token && json.refresh_token != atomicState.refreshToken) atomicState.refreshToken = json.refresh_token as String
+        rt.loginBlockedUntil = 0L
+        loginOver()
+        state.status = "Logged in"
+        logDebug data.kind == "refresh" ? "Access token renewed" : "Logged in"
+        takeWaiting().each { send(it) }
+        return
+    }
+    if (isOutage(status)) {
+        loginOver()
+        loginOutage(status, resp)
+        return
+    }
+    if (data.kind == "refresh") {
+        // The refresh token is no longer accepted: log in with the password.
+        logDebug "Token renewal answered HTTP ${status}, logging in again"
+        atomicState.remove("refreshToken")
+        loginAuthorize()
+        return
+    }
+    loginRefused("the token request answered HTTP ${status}${json instanceof Map && json.error ? ' (' + json.error + ')' : ''}")
+}
+
+/**
+ * A login step that SolarEdge or the network failed: no answer is an outage; a
+ * server error or rate limit also holds logins back, since a locked account answers
+ * 500, then 401 (com.solaredge, live 2026-10-16), and logging in on makes a lockout
+ * last. Otherwise keeps the step's cookies.
+ */
+private boolean loginStepFailed(resp, String step) {
+    int status = statusOf(resp)
+    if (status <= 0 || status == 408) {
+        loginOver()
+        loginOutage(status, resp)
+        return true
+    }
+    if (status >= 500 || status == 429) {
+        holdLogins("SolarEdge login unavailable (${step} answered HTTP ${status})")
+        loginOver()
+        failWaiting(state.status as String, true, status)
+        return true
+    }
+    Map login = runtime().login
+    if (login) cookiesOf(resp).each { String c -> int i = c.indexOf("="); login.jar[c.substring(0, i)] = c.substring(i + 1) }
+    return false
+}
+
+private void loginOutage(int status, resp) {
+    state.status = "SolarEdge login unavailable (HTTP ${status}${errorMessage(resp) ? ', ' + errorMessage(resp) : ''})"
+    log.warn "SolarEdge: ${state.status}"
+    failWaiting(state.status as String, true, status)
+}
+
+/** A login answer that isn't a wrong password but isn't a login either: hold back too. */
+private void loginRefused(String why) {
+    holdLogins("SolarEdge refused the login: ${why}")
+    loginOver()
+    failWaiting("Login refused", false)
+}
+
+private void loginOver() {
     Map rt = runtime()
     rt.remove("loggingIn")
-    int status = statusOf(resp)
-    if (isOutage(status)) {
-        state.status = "SolarEdge login unavailable (HTTP ${status}${errorMessage(resp) ? ', ' + errorMessage(resp) : ''})"
-        log.warn "SolarEdge: ${state.status}"
-        failWaiting(state.status, true, status)
-        return
-    }
-    List cookies = cookiesOf(resp)
-    String location = headerOf(resp, "Location")
-    // A good login answers 302 to the portal with the session cookies; a failed one
-    // redirects back to the login page (Spring: /login?error). If the hub followed
-    // the redirect, a 200 with cookies and no login form also counts.
-    boolean toLogin = location != null && location.toLowerCase() =~ /login|error/
-    boolean ok = cookies && ((status >= 300 && status < 400 && !toLogin) || (status == 200 && !looksLikeLoginForm(bodyOf(resp))))
-    if (!ok) {
-        holdLogins("SolarEdge rejected the e-mail or password (HTTP ${status}${toLogin ? ', back to the login page' : ''})")
-        failWaiting("Invalid e-mail and/or password", false, status)
-        return
-    }
-    // Only a session that has carried an answer clears the login backoff (requestDone).
-    logDebug "Logged in: HTTP ${status}, cookies ${cookies.collect { it.split('=')[0] }}"
-    rt.cookies = cookies
-    rt.cookieGen = ((rt.cookieGen ?: 0) as int) + 1
-    rt.loggedInAt = now()
-    state.status = "Logged in"
-    takeWaiting().each { send(it) }
+    rt.remove("login")
 }
 
-private boolean looksLikeLoginForm(String body) { body != null && body.contains("j_password") }
+private void loginGet(String origin, String path, Map query, String cb) {
+    Map login = runtime().login
+    Map params = [uri: origin, path: path, contentType: "text/plain", timeout: REQUEST_TIMEOUT, followRedirects: false,
+        headers: [Accept: "text/html,application/json"]]
+    if (query) params.query = query
+    if (login?.jar) params.headers.Cookie = jarHeader(login.jar)
+    asynchttpGet(cb, params, [:])
+}
+
+private String jarHeader(Map jar) { jar.collect { k, v -> "${k}=${v}" }.join("; ") }
+
+private String enc(String s) { URLEncoder.encode(s ?: "", "UTF-8") }
+
+/** A Location as [origin, path, query map], resolved against `origin` when relative. */
+Map splitUrl(String url, String origin) {
+    def m = url =~ /^(https?:\/\/[^\/?#]+)?([^?#]*)(?:\?([^#]*))?/
+    m.find()
+    String o = m.group(1) ?: origin
+    String path = m.group(2) ?: "/"
+    Map query = [:]
+    (m.group(3) ?: "").split("&").findAll { it }.each { String kv ->
+        int i = kv.indexOf("=")
+        String k = URLDecoder.decode(i < 0 ? kv : kv.substring(0, i), "UTF-8")
+        query[k] = i < 0 ? "" : URLDecoder.decode(kv.substring(i + 1), "UTF-8")
+    }
+    return [origin: o, path: path, query: query]
+}
 
 /** No automatic login for a while, doubling per failure from 1 min up to 1 h. */
 private void holdLogins(String why) {
@@ -573,8 +749,9 @@ private void holdLogins(String why) {
     long delay = Math.min(rt.loginRetryMs ? (rt.loginRetryMs as long) * 2 : LOGIN_RETRY_MIN, LOGIN_RETRY_MAX)
     rt.loginRetryMs = delay
     rt.loginBlockedUntil = now() + delay
-    rt.cookies = []
-    state.status = "${why}. Next login in ${delay.intdiv(60000)} min, or save the settings again."
+    rt.loginBlockedWhy = why
+    rt.remove("token")
+    state.status = "${why}. Next login in ${delay.intdiv(60000)} min, or press Done in the app."
     log.warn "SolarEdge: ${state.status}"
 }
 
