@@ -222,6 +222,19 @@ check("first tick: each device's summary line, with units") {
     assert child("battery").events.count { it.name == "summary" } == 1
 }
 
+check("summary: uses this run's values even when currentValue still reads the old ones (as on a hub)") {
+    FakeDevice d = hub.device("SolarEdge Inverter", "x-cache")
+    d.applyEvents([[name: "power", value: 1780, unit: "W"], [name: "energyToday", value: 1.1, unit: "kWh"]])
+    assert d.current.summary.startsWith("Producing 1.8 kW · today 1.1 kWh")
+    d.cacheReads()
+    d.applyEvents([[name: "power", value: 1720, unit: "W"], [name: "energyToday", value: 1.183, unit: "kWh"]])
+    assert d.current.summary.startsWith("Producing 1.7 kW · today 1.2 kWh")
+    // A value not in this run still comes from the device.
+    d.cacheReads()
+    d.applyEvents([[name: "inverterStatus", value: "production"]])
+    assert d.current.summary.startsWith("Producing 1.7 kW · today 1.2 kWh")
+}
+
 check("summary: night inverter, idle grid, unplugged charger") {
     FakeDevice d = hub.device("SolarEdge Inverter", "x-inv")
     d.applyEvents([[name: "power", value: 0, unit: "W"], [name: "inverterStatus", value: "sleeping"], [name: "energyToday", value: 31.25, unit: "kWh"]])

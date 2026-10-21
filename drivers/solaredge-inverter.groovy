@@ -10,6 +10,13 @@
  * GNU General Public License v3.0 or later; see LICENSE.
  */
 
+import groovy.transform.Field
+
+// This run's new values. On a hub, device.currentValue() right after sendEvent can
+// still return the cached previous value, so the summary reads these first. A driver
+// script is a new instance per run, so this doesn't outlive it.
+@Field Map freshValues = [:]
+
 metadata {
     definition(name: "SolarEdge Inverter", namespace: "solaredge", author: "Digital Homesteaders", importUrl: "") {
         capability "Sensor"
@@ -64,7 +71,9 @@ def refresh() {
 
 /** The forecast was turned off in the app: drop its values instead of leaving the last ones. */
 void clearForecast() {
-    ["forecastToday", "forecastTomorrow", "forecastPower", "forecastSoFar", "actualVsForecast"].each { device.deleteCurrentState(it) }
+    List attrs = ["forecastToday", "forecastTomorrow", "forecastPower", "forecastSoFar", "actualVsForecast"]
+    attrs.each { device.deleteCurrentState(it) }
+    freshValues = attrs.collectEntries { [(it): null] }
     sendSummary()
 }
 
@@ -72,6 +81,7 @@ void clearForecast() {
 
 /** Send the events whose value changed, then the summary line with units. */
 void applyEvents(List events) {
+    freshValues = events.findAll { it.value != null }.collectEntries { [(it.name): it.value] }
     events.each { Map e ->
         if (e.value == null || same(device.currentValue(e.name as String), e.value)) return
         Map evt = new LinkedHashMap(e)
@@ -108,7 +118,7 @@ private boolean quiet(String name) {
 
 // ---------------------------------------------------------------- summary
 
-private def cv(String attr) { device.currentValue(attr) }
+private def cv(String attr) { freshValues.containsKey(attr) ? freshValues[attr] : device.currentValue(attr) }
 
 private BigDecimal num(def v) {
     if (v == null) return null

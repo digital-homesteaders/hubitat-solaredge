@@ -338,12 +338,11 @@ itself still needs checking.
 1. The app and drivers save in Apps Code and Drivers Code. The local compile
    uses the same Groovy, but not Hubitat's sandbox (`ConcurrentHashMap` in a
    `@Field static`, `SimpleDateFormat`).
-2. **Login (OAuth, new on 2026-10-21):** check the whole flow on a real hub:
-   - that `asynchttpGet` and `asynchttpPost` honour `followRedirects: false`
-     on login.solaredge.com, with the Location and Set-Cookie headers the
-     steps need
-   - that the form's `csrf` value is found in the page as Hubitat returns it
-   - that the token answer arrives as JSON
+2. **Login (OAuth, new on 2026-10-21):** confirmed working on a real hub on
+   2026-10-21 (login, polling and healthStatus back to online). Still to
+   watch on a hub:
+   - the hourly token renewal without a password login (debug logging shows
+     "Access token renewed")
    - the 1-minute hold after a wrong password
 
    The tests run the flow against a fake login.solaredge.com modelled on

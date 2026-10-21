@@ -236,7 +236,11 @@ class FakeDevice {
     String getDisplayName() { label ?: name }
     String getDataValue(String k) { data[k] }
     void updateDataValue(String k, def v) { data[k] = v?.toString() }
-    def currentValue(String attr, boolean skipCache = false) { current[attr] }
+    // Like a hub, currentValue() can be set to read a cache taken earlier (cacheReads()),
+    // so a value sent in this run isn't read back until the next one.
+    Map cache = null
+    def currentValue(String attr, boolean skipCache = false) { cache != null && !skipCache ? cache[attr] : current[attr] }
+    void cacheReads() { cache = new LinkedHashMap(current) }
     void updateSetting(String name, def v) { driver.settings[name] = v instanceof Map ? v.value : v }
     void deleteCurrentState(String attr) { current.remove(attr) }
 
