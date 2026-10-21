@@ -1,3 +1,6 @@
 .DS_Store
 .tools/
 tests/build/
+
+# Dev notes, kept local
+CLAUDE.md
