@@ -100,7 +100,7 @@ abstract class HubitatScript extends Script {
         else super.setProperty(name, v)
     }
 
-    Map getLocation() { [temperatureScale: hub?.temperatureScale ?: "F", timeZone: TimeZone.getDefault()] }
+    Map getLocation() { [temperatureScale: hub?.temperatureScale ?: "F", timeZone: TimeZone.getDefault(), latitude: 52.3731339, longitude: 4.8903147] }
 
     // Settings are readable as bare names when declared with input.
     def propertyMissing(String name) {
@@ -134,6 +134,7 @@ abstract class HubitatScript extends Script {
     void runIn(Number secs, String handler, Map opts = [:]) { calls << ["runIn", secs, handler, opts, now()] }
     void runInMillis(Number ms, String handler, Map opts = [:]) { calls << ["runInMillis", ms, handler, opts, now()] }
     void runEvery30Minutes(String handler) { calls << ["runEvery30Minutes", handler] }
+    void runEvery1Hour(String handler) { calls << ["runEvery1Hour", handler] }
     void unschedule(String handler = null) { calls << ["unschedule", handler] }
     void unsubscribe() { calls << ["unsubscribe"] }
     void pauseExecution(Number ms) {}

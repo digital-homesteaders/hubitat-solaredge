@@ -29,6 +29,11 @@ metadata {
         attribute "optimizerTemperatureMax", "number"
         attribute "alerts", "number"
         attribute "siteConnectivity", "enum", ["online", "offline"]
+        attribute "forecastToday", "number"
+        attribute "forecastTomorrow", "number"
+        attribute "forecastPower", "number"
+        attribute "forecastSoFar", "number"
+        attribute "actualVsForecast", "number"
         attribute "summary", "string"
         attribute "healthStatus", "enum", ["online", "offline"]
     }
@@ -91,7 +96,8 @@ private boolean quiet(String name) {
     name in ["power", "energy", "energyToday", "energyMonth", "energyYear", "energyLifetime", "energyCharged",
         "energyDischarged", "energyImported", "energyExported", "energyImportedYear", "energyExportedYear",
         "residualEnergy", "sessionEnergy", "sessionDuration", "gridPower", "solarPower", "loadPower", "batteryPower",
-        "voltage", "voltageL1", "voltageL2", "voltageL3", "optimizerTemperatureMax"]
+        "voltage", "voltageL1", "voltageL2", "voltageL3", "optimizerTemperatureMax",
+        "forecastToday", "forecastTomorrow", "forecastPower", "forecastSoFar", "actualVsForecast"]
 }
 
 // ---------------------------------------------------------------- summary
@@ -139,6 +145,8 @@ private String summaryText() {
         cv("energyMonth") != null ? "month ${fmtEnergy(cv('energyMonth'))}" : null,
         cv("energyYear") != null ? "year ${fmtEnergy(cv('energyYear'))}" : null,
         cv("energyLifetime") != null ? "lifetime ${fmtEnergy(cv('energyLifetime'))}" : null,
+        cv("forecastToday") != null ? "forecast ${fmtEnergy(cv('forecastToday'))}${cv('forecastTomorrow') != null ? ', tomorrow ' + fmtEnergy(cv('forecastTomorrow')) : ''}" : null,
+        cv("actualVsForecast") != null ? "${cv('actualVsForecast')} % of forecast so far" : null,
         num(cv("voltage")) != null ? "${fmt(num(cv('voltage')), 1)} V" : null,
         temp != null ? "optimizers up to ${fmt(temp, 0)} °${location?.temperatureScale ?: 'C'}" : null,
         status && !(status in ["production", "sleeping"]) ? "status ${status.replace('_', ' ')}" : null,

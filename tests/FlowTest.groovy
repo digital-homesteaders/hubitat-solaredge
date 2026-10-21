@@ -143,7 +143,7 @@ check("discovery: one login, the sites, then per site power flow, devices and eq
     assert calls.count { it[0] == "asynchttpPost" } == 1
     assert gets(calls, "so/sites/") == 1 && gets(calls, "powerflow") == 1 && gets(calls, "equipment") == 1
     assert app.state.discovered.size() == 5
-    assert app.state.sites[SITE] == [name: "Synthetic site", tz: "Europe/Amsterdam", installYear: 2024, serials: "7E000000-00"]
+    assert app.state.sites[SITE] == [name: "Synthetic site", tz: "Europe/Amsterdam", installYear: 2024, peakPower: 8, serials: "7E000000-00"]
     assert !app.state.discovering
 }
 
@@ -806,6 +806,52 @@ check("info log: state changes only; power and energy readings in debug") {
     child("battery").applyEvents([[name: "power", value: 750, unit: "W"]])
     assert bat.driver.log.at("debug").any { it.contains("power 500 -> 750") }
     assert !bat.driver.log.at("info").any { it.contains("power is 750") }
+}
+
+check("solar forecast: hourly from Forecast.Solar, on the inverter and its summary") {
+    fresh()
+    Map answer = new JsonSlurper().parse(new File(root, "tests/fixtures/forecast-solar.json"))
+    override = { call -> call[2].uri == "https://api.forecast.solar" ? ok(answer) : null }
+    install()
+    FakeDevice inv = child("inverter")
+    assert inv.current.forecastToday == null, "off by default"
+    app.settings.forecastEnable = true
+    app.updated(); hub.settle()
+    assert app.callsNamed("runEvery1Hour").any { it[1] == "forecastRefresh" }
+    assert app.callsNamed("runIn").any { it[2] == "forecastRefresh" }
+    app.forecastRefresh(); hub.settle()
+    List calls = serve()
+    List fc = calls.findAll { it[2].uri == "https://api.forecast.solar" }
+    assert fc.size() == 1
+    // SolarEdge's peak power (8 kWp), the hub's location rounded, 30 degrees facing south
+    assert fc[0][2].path == "/estimate/52.37/4.89/30/0/8" && fc[0][2].query == [time: "iso8601"]
+    assert !fc[0][2].headers.containsKey("Cookie"), "no SolarEdge session goes to Forecast.Solar"
+    assert inv.current.forecastToday == 34.14 && inv.current.forecastTomorrow == 28.67
+    assert inv.current.forecastPower == 4990 && inv.current.actualVsForecast == 45
+    assert inv.current.summary.contains("forecast 34.1 kWh, tomorrow 28.7 kWh · 45 % of forecast so far")
+    // The polls keep it current without asking Forecast.Solar again.
+    hub.clock += 30 * 60000L
+    calls = fastTick()
+    assert !calls.any { it[2].uri == "https://api.forecast.solar" }
+    assert inv.current.forecastPower > 4500 && inv.current.forecastSoFar > 15.74
+    // Settings: size and direction.
+    app.settings.forecastKwp = 6.5
+    app.settings.forecastBearing = 135
+    app.settings.forecastTilt = 20
+    app.forecastRefresh()
+    assert app.callsNamed("asynchttpGet").last()[2].path == "/estimate/52.37/4.89/20/-45/6.5"
+    serve()
+    // A failure: one warning, and it comes back.
+    override = { call -> call[2].uri == "https://api.forecast.solar" ? new FakeResp(status: 429, data: JsonOutput.toJson([message: [text: "Rate limit for API calls reached."]])) : null }
+    2.times { app.forecastRefresh(); serve() }
+    assert app.log.at("warn").count { it.contains("solar forecast for site ${SITE} failed: Rate limit") } == 1
+    override = { call -> call[2].uri == "https://api.forecast.solar" ? ok(answer) : null }
+    app.forecastRefresh(); serve()
+    assert app.log.at("info").any { it.contains("solar forecast for site ${SITE} works again") }
+    // Turned off: no more forecast, and its state goes.
+    app.settings.forecastEnable = false
+    app.updated(); hub.settle()
+    assert !app.state.containsKey("forecast")
 }
 
 check("poll interval: default 60 s, clamped to 30-300") {

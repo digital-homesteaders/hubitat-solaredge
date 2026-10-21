@@ -140,6 +140,30 @@ device also has a **`summary`** attribute: one line with units, for example
 | `optimizerTemperatureMax` | hottest optimizer today, in the hub's scale |
 | `alerts` | number of open site alerts |
 | `siteConnectivity` | online/offline. Offline is not reported while the inverter sleeps. |
+| `forecastToday`, `forecastTomorrow` | expected production (kWh), with the solar forecast on |
+| `forecastPower`, `forecastSoFar` | expected power now (W) and expected energy so far today (kWh) |
+| `actualVsForecast` | `energyToday` as % of `forecastSoFar` |
+
+#### Solar forecast
+
+Turn on **Solar forecast from Forecast.Solar** in the app to compare actual
+production with what was expected, like Homey's Energy view does.
+[Forecast.Solar](https://forecast.solar) is a free public service and needs
+no account.
+- **What it gets:** once an hour, the hub's location (from Settings >
+  Location, rounded to about 1 km), the panel tilt, the direction they face
+  and the system size.
+- **What comes back:** the expected power through today and tomorrow, which
+  the app stores and reads at every poll.
+- **Settings:** the system size defaults to the peak power SolarEdge reports
+  (on an existing install, open **Choose devices** once so the app reads it,
+  or enter it). Tilt defaults to 30° and direction to 180° (south); set
+  them to your roof.
+- **Several sites:** all use the hub's location and the same tilt and
+  direction.
+- **Limits:** the free service allows 12 requests an hour; the app uses 1 per
+  site. Its forecast is a model from weather data, so expect it to be off by
+  a fair amount on changeable days.
 
 ### SolarEdge Meter
 
@@ -308,7 +332,10 @@ itself still needs checking.
    discharge of about 0.55 kWh around 22:15–22:41 never showed up in the
    power flow or the devices list. The stale-data warnings and the raw-data
    button above are there to find out why.
-8. EV charger and load controller commands. These were never tested live in
+8. The solar forecast against the real Forecast.Solar API: the tests use a
+   made-up answer in the documented shape (`tests/fixtures/forecast-solar.json`),
+   including the `time=iso8601` option. The app also reads plain local times.
+9. EV charger and load controller commands. These were never tested live in
    2.0.0 either.
 
 ## Credits and licence
@@ -319,5 +346,6 @@ A port of [com.solaredge](https://github.com/gruijter/com.solaredge) v2.0.0
 for Homey by **Robin de Gruijter**, itself based on the original app by Emile
 Nijssen (Athom). The SolarEdge cloud client, the energy-tick timing, the
 device mappings and the test fixtures come from that project (GPL-3.0).
-Hubitat port and changes © 2026 Digital Homesteaders. Not affiliated with or endorsed
+Solar forecasts by [Forecast.Solar](https://forecast.solar) (free public
+API). Hubitat port and changes © 2026 Digital Homesteaders. Not affiliated with or endorsed
 by SolarEdge.

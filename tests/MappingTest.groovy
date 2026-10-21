@@ -334,6 +334,61 @@ check("devices list: every poll with a load controller or a charging EV, else on
     assert app.devicesDue([ev("plugged_out"), ev("plugged_in_charging")], false)
 }
 
+// ---------------------------------------------------------------- solar forecast
+
+@Field Map forecastAnswer = new JsonSlurper().parse(new File(root, "tests/fixtures/forecast-solar.json"))
+
+/** The forecast events at time t, with the sample answer stored for site 1. */
+Map forecastAt(long t, def actual) {
+    app.settings.forecastEnable = true
+    app.state.forecast = ["1": app.parseForecast(forecastAnswer.result, "Europe/Amsterdam")]
+    hub.settle()
+    Map v = evs(app.forecastEvents("1", t, actual))
+    app.settings.remove("forecastEnable")
+    return v
+}
+
+long iso(String s) { app.parseIso(s) as long }
+
+check("forecast path: location rounded to ~1 km, azimuth from south, tilt kept in range") {
+    assert app.forecastPath(52.3731339d, 4.8903147d, 30, 180, 8d) == "/estimate/52.37/4.89/30/0/8"
+    assert app.forecastPath(52.3731339d, 4.8903147d, 35, 90, 8.25d) == "/estimate/52.37/4.89/35/-90/8.25"
+    assert app.forecastPath(-33.86d, 151.21d, 95, 270, 5d) == "/estimate/-33.86/151.21/90/90/5"
+    assert app.forecastPath(40d, -74d, 20, 0, 6.4d) == "/estimate/40.00/-74.00/20/-180/6.4"
+}
+
+check("forecast at midday: today, tomorrow, power now, so far, actual vs forecast") {
+    Map v = forecastAt(captured, 7.131)
+    assert v.forecastToday == 34.14 && v.forecastTomorrow == 28.67
+    assert v.forecastPower == 4990
+    assert v.forecastSoFar == 15.74
+    assert v.actualVsForecast == 45
+}
+
+check("forecast before sunrise, after sunset, and the next day") {
+    Map dawn = forecastAt(iso("2026-10-15T06:00:00+02:00"), 0)
+    assert dawn.forecastPower == 0 && dawn.forecastSoFar == 0 && !dawn.containsKey("actualVsForecast")
+    Map dusk = forecastAt(iso("2026-10-15T20:00:00+02:00"), 30.0)
+    assert dusk.forecastPower == 0 && dusk.forecastSoFar == 34.14 && dusk.actualVsForecast == 88
+    // An hour-old forecast after midnight: yesterday's tomorrow is today, nothing known for tomorrow.
+    Map next = forecastAt(iso("2026-10-16T12:30:00+02:00"), 10.0)
+    assert next.forecastToday == 28.67 && !next.containsKey("forecastTomorrow")
+    assert next.forecastPower > 3500 && next.forecastSoFar > 10
+    // Two days later the forecast says nothing about today.
+    assert forecastAt(iso("2026-10-17T12:00:00+02:00"), 1.0) == [:]
+}
+
+check("forecast times as local 'yyyy-MM-dd HH:mm:ss' are read in the forecast's timezone") {
+    Map fc = app.parseForecast([watts: ["2026-10-15 13:00:00": 4985], watt_hours: [:], watt_hours_day: ["2026-10-15": 34136]], "Europe/Amsterdam")
+    assert fc.watts == [[iso("2026-10-15T13:00:00+02:00"), 4985d]]
+    assert fc.days == ["2026-10-15": 34136d]
+}
+
+check("forecast off: no forecast events") {
+    app.state.forecast = ["1": app.parseForecast(forecastAnswer.result, "Europe/Amsterdam")]
+    assert app.forecastEvents("1", captured, 7.131) == []
+}
+
 check("ISO times") {
     assert app.parseIso("2026-10-15T11:50:28Z") == Date.parse("yyyy-MM-dd'T'HH:mm:ssX", "2026-10-15T11:50:28Z").time
     assert app.parseIso("2026-10-15T11:50:28.123Z") == app.parseIso("2026-10-15T11:50:28Z")
