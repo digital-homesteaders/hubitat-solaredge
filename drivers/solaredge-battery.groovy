@@ -18,7 +18,7 @@ import groovy.transform.Field
 @Field Map freshValues = [:]
 
 metadata {
-    definition(name: "SolarEdge Battery", namespace: "solaredge", author: "Digital Homesteaders", importUrl: "") {
+    definition(name: "SolarEdge Battery", namespace: "solaredge", author: "Digital Homesteaders", importUrl: "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/drivers/solaredge-battery.groovy") {
         capability "Sensor"
         capability "Battery"
         capability "PowerMeter"

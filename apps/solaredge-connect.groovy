@@ -41,7 +41,7 @@ definition(
     singleInstance: false,
     iconUrl: "",
     iconX2Url: "",
-    importUrl: ""
+    importUrl: "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/apps/solaredge-connect.groovy"
 )
 
 preferences {

@@ -4,15 +4,15 @@
   "version": "0.1.0",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-10-17",
-  "documentationLink": "https://github.com/GITHUB_OWNER/hubitat-solaredge#readme",
-  "licenseFile": "https://raw.githubusercontent.com/GITHUB_OWNER/hubitat-solaredge/main/LICENSE",
+  "documentationLink": "https://github.com/digital-homesteaders/hubitat-solaredge#readme",
+  "licenseFile": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/LICENSE",
   "releaseNotes": "First release: SolarEdge inverters, meters, batteries, EV chargers and load controllers through the mySolarEdge cloud. Port of com.solaredge 2.0.0 for Homey by Robin de Gruijter.",
   "apps": [
     {
       "id": "753692ae-ef16-40a8-a573-aac84f129b91",
       "name": "SolarEdge Connect",
       "namespace": "solaredge",
-      "location": "https://raw.githubusercontent.com/GITHUB_OWNER/hubitat-solaredge/main/apps/solaredge-connect.groovy",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/apps/solaredge-connect.groovy",
       "required": true,
       "oauth": false,
       "primary": true
@@ -23,35 +23,35 @@
       "id": "933a8d05-0514-4b05-896f-88c186ee5bce",
       "name": "SolarEdge Inverter",
       "namespace": "solaredge",
-      "location": "https://raw.githubusercontent.com/GITHUB_OWNER/hubitat-solaredge/main/drivers/solaredge-inverter.groovy",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/drivers/solaredge-inverter.groovy",
       "required": true
     },
     {
       "id": "8afec126-544f-419b-99f4-ffde9d8ef900",
       "name": "SolarEdge Meter",
       "namespace": "solaredge",
-      "location": "https://raw.githubusercontent.com/GITHUB_OWNER/hubitat-solaredge/main/drivers/solaredge-meter.groovy",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/drivers/solaredge-meter.groovy",
       "required": true
     },
     {
       "id": "ff6c75e9-00b3-4cdd-a0fc-8c5a592f0ed2",
       "name": "SolarEdge Battery",
       "namespace": "solaredge",
-      "location": "https://raw.githubusercontent.com/GITHUB_OWNER/hubitat-solaredge/main/drivers/solaredge-battery.groovy",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/drivers/solaredge-battery.groovy",
       "required": true
     },
     {
       "id": "6fae39bc-f6f2-45ae-8395-659fcab05018",
       "name": "SolarEdge EV Charger",
       "namespace": "solaredge",
-      "location": "https://raw.githubusercontent.com/GITHUB_OWNER/hubitat-solaredge/main/drivers/solaredge-ev-charger.groovy",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/drivers/solaredge-ev-charger.groovy",
       "required": true
     },
     {
       "id": "f5de47ca-516e-4bf6-8609-d4c76c12e553",
       "name": "SolarEdge Load Controller",
       "namespace": "solaredge",
-      "location": "https://raw.githubusercontent.com/GITHUB_OWNER/hubitat-solaredge/main/drivers/solaredge-load-controller.groovy",
+      "location": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/drivers/solaredge-load-controller.groovy",
       "required": true
     }
   ]

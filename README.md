@@ -114,8 +114,11 @@ These come from a review of the Homey app (1.8.1, and the 2.0.0 rewrite):
 
 ### Hubitat Package Manager
 
-Not published yet. Once the repository is on GitHub, replace the
-`GITHUB_OWNER` placeholders in `packageManifest.json`.
+In **Hubitat Package Manager**, choose **Install → From a URL** and paste:
+
+```
+https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/packageManifest.json
+```
 
 ### Manually
 
