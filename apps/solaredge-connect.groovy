@@ -70,6 +70,12 @@ preferences {
 @Field static final int SLOW_EVERY = 3
 // A fast tick this close before the energy tick is left to the energy tick (which polls too).
 @Field static final long ENERGY_MERGE_MS = 15 * 1000L
+// A devices list SolarEdge last updated longer ago than this counts as stale.
+@Field static final long STALE_DATA_MS = 10 * 60 * 1000L
+// Hubitat log lines are kept short: raw answers are logged in pieces of this size.
+@Field static final int RAW_CHUNK = 1500
+// Fields left out of raw answers in the log: vehicle and network identifiers.
+@Field static final List RAW_REDACT = ["macAddress", "physicalId", "siteApplianceUUID", "rfIdCardsListSupported"]
 // Battery charged/discharged are integrated from power samples; not across a gap longer
 // than this or 3 poll intervals (an outage, a hub restart).
 @Field static final long MAX_SAMPLE_GAP_MS = 10 * 60 * 1000L
@@ -159,6 +165,11 @@ def mainPage() {
         }
         section("Logging") {
             input "logEnable", "bool", title: "Debug logging (turns itself off after 30 minutes)", defaultValue: false
+            if (siteDevices()) {
+                input name: "dumpRaw", type: "button", title: "Log raw SolarEdge data"
+                paragraph "Writes SolarEdge's current answers for each site (power flow, devices, batteries, inverters) to Logs, " +
+                    "without vehicle or network identifiers. Stale or failing answers are also logged as warnings on their own."
+            }
         }
     }
 }
@@ -779,6 +790,7 @@ void finishTick(Map tk) {
     tk.reqs.each { String key, Map req ->
         Map res = results[key]
         if (res == null) return
+        noteAnswer(key, req, res, now())
         String k = "${req.kind}:${req.siteId}" + (req.year != null ? ":${req.year}" : "") + (req.reporterId ? ":${req.reporterId}" : "")
         k = k.toString()
         by[k] = res
@@ -809,6 +821,102 @@ void finishTick(Map tk) {
         idle[k.split(":")[1]] = !(sp?.isActive) || !(sp?.currentPower)
     }
     state.solarIdle = idle
+}
+
+/**
+ * Warn once when a request starts failing or its answer looks stale, and say
+ * once when it is back: one failing endpoint, or SolarEdge serving old data,
+ * doesn't fail the tick, so nothing else would show it.
+ */
+private void noteAnswer(String key, Map req, Map res, long t) {
+    Map failing = runtimeMap("failing")
+    Map stale = runtimeMap("stale")
+    String what = "${req.kind}${req.year != null ? ' ' + req.year : ''} for site ${req.siteId}"
+    if (res.error) {
+        if (failing.putIfAbsent(key, res.error) == null) log.warn "SolarEdge: ${what} failed: ${res.error} (logged again only once it works)"
+        return
+    }
+    if (failing.remove(key) != null) log.info "SolarEdge: ${what} works again"
+    String why = staleReason(req.kind as String, res.json, t)
+    if (why) {
+        if (stale.putIfAbsent(key, why) == null) log.warn "SolarEdge: ${what} looks stale: ${why}"
+    } else if (stale.remove(key) != null) {
+        log.info "SolarEdge: ${what} is live again"
+    }
+}
+
+/** Why an answer looks like old data, or null: the power flow not real time, the devices list not updated lately. */
+String staleReason(String kind, def json, long t) {
+    if (!(json instanceof Map)) return null
+    List why = []
+    if (kind == "powerflow") {
+        if (json.isRealTime == false) why << "isRealTime false"
+        if (json.isCommunicating == false) why << "isCommunicating false"
+    } else if (kind == "siteDevices") {
+        if (json.isUpdated == false) why << "isUpdated false"
+        if (json.fieldLastUpdateTS instanceof Number && t - (json.fieldLastUpdateTS as long) > STALE_DATA_MS) {
+            why << "last updated ${(t - (json.fieldLastUpdateTS as long)).intdiv(60000)} min ago"
+        }
+    }
+    return why ? why.join(", ") : null
+}
+
+private Map runtimeMap(String name) {
+    Map rt = runtime()
+    Map m = rt[name]
+    if (m == null) {
+        rt.putIfAbsent(name, new ConcurrentHashMap())
+        m = rt[name]
+    }
+    return m
+}
+
+// ---------------------------------------------------------------- raw data
+
+def appButtonHandler(String btn) {
+    if (btn == "dumpRaw") dumpRaw()
+}
+
+/** Ask for each site's current answers and log them as they come (rawDone). */
+void dumpRaw() {
+    Map bySite = siteDevices().groupBy { it.getDataValue("siteId") }
+    log.info "SolarEdge: logging raw data for ${bySite.size()} site${bySite.size() == 1 ? '' : 's'}"
+    bySite.each { String siteId, List devs ->
+        List types = devs*.getDataValue("type")
+        List reqs = [reqPowerflow(siteId) + [ctx: [kind: "powerflow"]], reqSiteDevices(siteId) + [ctx: [kind: "siteDevices"]]]
+        if ("battery" in types) reqs << reqBatteries(siteId) + [ctx: [kind: "batteries"]]
+        String serials = devs.find { it.getDataValue("serials") }?.getDataValue("serials") ?: (state.sites ?: [:])[siteId]?.serials
+        if (serials) reqs << reqInverters(serials.split(",") as List) + [ctx: [kind: "inverters"]]
+        reqs.each { send(it + [cb: "rawDone", ctx: it.ctx + [siteId: siteId]]) }
+    }
+}
+
+def rawDone(Map result, Map ctx) {
+    String what = "raw ${ctx.kind} site ${ctx.siteId}"
+    if (result.error) {
+        log.warn "SolarEdge: ${what} failed: ${result.error}"
+        return
+    }
+    String why = staleReason(ctx.kind as String, result.json, now())
+    String text = JsonOutput.toJson(redact(result.json))
+    List parts = []
+    for (int i = 0; i < text.length(); i += RAW_CHUNK) parts << text.substring(i, Math.min(text.length(), i + RAW_CHUNK))
+    log.info "SolarEdge: ${what}${why ? ' (looks stale: ' + why + ')' : ''}, ${text.length()} chars in ${parts.size()} part${parts.size() == 1 ? '' : 's'}"
+    parts.eachWithIndex { String part, int i -> log.info "SolarEdge: ${what} ${i + 1}/${parts.size()}: ${part}" }
+}
+
+/** A copy without vehicle and network identifiers (RAW_REDACT, and the vehicle's id). */
+def redact(def v, String parent = null) {
+    if (v instanceof Map) {
+        Map out = [:]
+        v.each { k, x ->
+            String key = k as String
+            out[key] = (key in RAW_REDACT || (parent == "applianceData" && key == "id")) ? "(hidden)" : redact(x, key)
+        }
+        return out
+    }
+    if (v instanceof List) return v.collect { redact(it, parent) }
+    return v
 }
 
 private void noteOutage(boolean rateLimited) {

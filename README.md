@@ -191,6 +191,24 @@ SolarEdge Home Battery 400V (`tests/fixtures/batteries-two.json`).
 | `controllerState`, `setState(on/off/auto)`, `setAutomatic()` | manual on, manual off, or SolarEdge's automatic control |
 | PowerMeter `power`, `powerSource` | the relay's meter, else rated power × level (`estimated`) |
 
+## Diagnostics
+
+- **Stale or failing answers** are logged as a warning when they start and as
+  one info line when they're back, so they don't repeat every poll:
+  - "powerflow for site … looks stale: isRealTime false", for a power flow
+    that SolarEdge doesn't mark as real time (or as communicating)
+  - "siteDevices for site … looks stale: last updated 33 min ago", for a
+    devices list (EV chargers, load controllers) SolarEdge hasn't updated
+    for over 10 minutes
+  - "… failed: HTTP 500", for any request that fails while the rest of the
+    poll works
+- **Log raw SolarEdge data** (button in the app, under Logging) asks for each
+  site's power flow, devices list, batteries and inverters right away and
+  writes the answers to Logs, split into numbered pieces. Vehicle and network
+  identifiers (plate, vehicle ids, MAC address) are left out. Press it while
+  something looks wrong, for example while the car charges and the devices
+  don't show it.
+
 ## Limitations
 
 - Needs SolarEdge's cloud. There is no local (Modbus) access.
@@ -275,7 +293,12 @@ itself still needs checking.
    at 0 W and the device staying online.
 6. The energy tick moving to just after the inverter upload. Turn on debug
    logging to see "Energy tick moved to …".
-7. EV charger and load controller commands. These were never tested live in
+7. Whether SolarEdge serves live data at night without the phone app open.
+   On 2026-10-20 a car charge of about 33 min (5.2 kWh) and a battery
+   discharge of about 0.55 kWh around 22:15–22:41 never showed up in the
+   power flow or the devices list. The stale-data warnings and the raw-data
+   button above are there to find out why.
+8. EV charger and load controller commands. These were never tested live in
    2.0.0 either.
 
 ## Credits and licence

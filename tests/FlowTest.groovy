@@ -710,6 +710,59 @@ check("discovery copes with installationDate as epoch ms or an unknown format") 
     }
 }
 
+check("stale and failing answers: one warning each, and one line when they're back") {
+    fresh()
+    String pf = app.reqPowerflow(SITE).key
+    String devs = app.reqSiteDevices(SITE).key
+    Map live = new LinkedHashMap(replay[pf])
+    replay[devs] = replay[devs] + [fieldLastUpdateTS: hub.clock]
+    install()
+    Closure warns = { app.log.at("warn").findAll { it.contains("site ${SITE}") } }
+    assert warns() == []
+    // SolarEdge stops serving live data, and the devices list starts failing.
+    replay[pf] = live + [isRealTime: false]
+    override = { call -> call[2].path?.endsWith("/devices") ? new FakeResp(status: 500, data: "") : null }
+    fastTick()
+    fastTick()
+    assert warns() == ["SolarEdge: powerflow for site ${SITE} looks stale: isRealTime false".toString(),
+        "SolarEdge: siteDevices for site ${SITE} failed: HTTP 500 (logged again only once it works)".toString()]
+    // Back to normal.
+    replay[pf] = live
+    replay[devs] = replay[devs] + [fieldLastUpdateTS: hub.clock + 60000]
+    override = null
+    fastTick()
+    List infos = app.log.at("info").findAll { it.contains("site ${SITE}") }
+    assert infos.contains("SolarEdge: powerflow for site ${SITE} is live again".toString())
+    assert infos.contains("SolarEdge: siteDevices for site ${SITE} works again".toString())
+    // The devices list goes untouched for half an hour: stale.
+    hub.clock += 30 * 60000L
+    fastTick()
+    assert warns().last() ==~ /SolarEdge: siteDevices for site 9999999 looks stale: last updated 3\d min ago/
+}
+
+check("Log raw SolarEdge data: each answer logged in pieces, identifiers hidden") {
+    fresh()
+    install()
+    app.mainPage()
+    assert app.declaredInputs.containsKey("dumpRaw")
+    int before = httpCalls().size()
+    app.appButtonHandler("dumpRaw")
+    List calls = serve()
+    assert calls.size() == httpCalls().size() - before
+    assert gets(calls, "powerflow") == 1 && gets(calls, "v1.0/sites/") == 1 && gets(calls, "getBatteries") == 1 && gets(calls, "information/inverters") == 1
+    List lines = app.log.at("info").findAll { it.contains("raw siteDevices site ${SITE}") }
+    assert lines[0] ==~ /SolarEdge: raw siteDevices site 9999999 \(looks stale: last updated \d+ min ago\), \d+ chars in \d+ parts/
+    int n = (lines[0] =~ /in (\d+) parts/)[0][1] as int
+    assert n > 1 && lines.size() == n + 1
+    String text = lines.drop(1).collect { it.replaceFirst(/^SolarEdge: raw siteDevices site 9999999 \d+\/\d+: /, "") }.join("")
+    Map back = new JsonSlurper().parseText(text)
+    assert back.devicesByType.EV_CHARGER[0].applianceData.alias == "Ioniq"
+    assert !text.contains("XXX-0000") && !text.contains("xxxxxxxx-xxxx")
+    assert app.log.at("info").any { it.startsWith("SolarEdge: raw powerflow site ${SITE}, ") }
+    // It doesn't disturb the poll: no tick is left running.
+    assert app.runtime().tick == null
+}
+
 check("poll interval: default 60 s, clamped to 30-300") {
     fresh()
     assert app.pollInterval() == 60

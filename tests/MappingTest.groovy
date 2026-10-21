@@ -298,6 +298,28 @@ check("getSites answer as map or list") {
     assert app.sitesOf(fx("getSites"))*.id == [9999999]
 }
 
+check("stale answers: power flow not real time, devices list not updated lately") {
+    long t = captured
+    assert app.staleReason("powerflow", [isRealTime: true, isCommunicating: true], t) == null
+    assert app.staleReason("powerflow", [isRealTime: false], t) == "isRealTime false"
+    assert app.staleReason("powerflow", [isRealTime: false, isCommunicating: false], t) == "isRealTime false, isCommunicating false"
+    assert app.staleReason("siteDevices", [isUpdated: true, fieldLastUpdateTS: t - 9 * 60000L], t) == null
+    assert app.staleReason("siteDevices", [isUpdated: true, fieldLastUpdateTS: t - 33 * 60000L], t) == "last updated 33 min ago"
+    assert app.staleReason("siteDevices", [isUpdated: false], t) == "isUpdated false"
+    assert app.staleReason("batteries", [isUpdated: false], t) == null
+    assert app.staleReason("powerflow", null, t) == null
+}
+
+check("raw data: vehicle and network identifiers hidden, the rest kept") {
+    Map resp = fx("getSiteDevices")
+    Map r = app.redact(resp)
+    Map ev = r.devicesByType.EV_CHARGER[0]
+    assert ev.macAddress == "(hidden)" && ev.applianceData.physicalId == "(hidden)" && ev.applianceData.id == "(hidden)"
+    assert ev.applianceData.siteApplianceUUID == "(hidden)" && r.rfIdCardsListSupported == "(hidden)"
+    assert ev.reporterId == 1000001479067354 && ev.applianceData.alias == "Ioniq" && ev.sessionEnergy == 93
+    assert resp.devicesByType.EV_CHARGER[0].applianceData.physicalId == "XXX-0000", "the answer itself is untouched"
+}
+
 check("ISO times") {
     assert app.parseIso("2026-10-15T11:50:28Z") == Date.parse("yyyy-MM-dd'T'HH:mm:ssX", "2026-10-15T11:50:28Z").time
     assert app.parseIso("2026-10-15T11:50:28.123Z") == app.parseIso("2026-10-15T11:50:28Z")
