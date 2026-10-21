@@ -62,6 +62,12 @@ def refresh() {
     parent?.refreshNow()
 }
 
+/** The forecast was turned off in the app: drop its values instead of leaving the last ones. */
+void clearForecast() {
+    ["forecastToday", "forecastTomorrow", "forecastPower", "forecastSoFar", "actualVsForecast"].each { device.deleteCurrentState(it) }
+    sendSummary()
+}
+
 // ---------------------------------------------------------------- events from the app
 
 /** Send the events whose value changed, then the summary line with units. */

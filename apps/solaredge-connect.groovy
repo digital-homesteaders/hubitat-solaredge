@@ -260,11 +260,13 @@ void initialize() {
     if (settings.logEnable) runIn(1800, "logsOff")
     syncChildren()
     state.timing = timing()
+    state.remove("forecast")  // kept in memory now (runtime forecast)
     if (settings.forecastEnable && siteDevices()) {
         runEvery1Hour("forecastRefresh")
         runIn(10, "forecastRefresh")
     } else {
-        state.remove("forecast")
+        runtimeMap("forecast").clear()
+        siteDevices().findAll { it.getDataValue("type") == "inverter" && it.currentValue("forecastToday") != null }.each { cd -> cd.clearForecast() }
     }
     if (siteDevices()) {
         rt.energyDue = true
@@ -683,6 +685,11 @@ def tick() {
         logDebug "Tick left to the energy tick due in ${untilEnergy.intdiv(1000)} s"
         return
     }
+    // The forecast lives in memory: after a hub restart or code save, ask again.
+    if (settings.forecastEnable && runtimeMap("forecast").isEmpty() && now() - ((rt.forecastAskedAt ?: 0L) as long) > 10 * 60000L) {
+        rt.forecastAskedAt = now()
+        runIn(1, "forecastRefresh")
+    }
     boolean energy = rt.remove("energyDue") as boolean
     boolean slow = false
     if (energy) {
@@ -756,7 +763,8 @@ List planTick(List devices, boolean energy, boolean slow) {
 
 /**
  * Whether this poll needs the site's devices list. Load controllers need it every
- * poll. EV chargers only while one charges (or its state is unknown yet), for its
+ * poll, and so do several EV chargers on one site. One EV charger only while it
+ * charges (or its state is unknown yet), for its
  * own power and the session; otherwise the power flow has their plug status, and
  * the list is read on the energy tick. A charge that starts shows in the power
  * flow first, and the next poll reads the list again.
@@ -765,6 +773,8 @@ boolean devicesDue(List devs, boolean energy) {
     if (devs.any { it.type == "hlc" }) return true
     List evs = devs.findAll { it.type == "ev" }
     if (!evs) return false
+    // The power flow's evCharger is one per site: with several chargers only the list tells them apart.
+    if (evs.size() > 1) return true
     return energy || evs.any { it.chargingState == null || it.chargingState == "plugged_in_charging" }
 }
 
@@ -869,14 +879,12 @@ void finishTick(Map tk) {
  * doesn't fail the tick, so nothing else would show it.
  */
 private void noteAnswer(String key, Map req, Map res, long t) {
-    Map failing = runtimeMap("failing")
     Map stale = runtimeMap("stale")
     String what = "${req.kind}${req.year != null ? ' ' + req.year : ''} for site ${req.siteId}"
-    if (res.error) {
-        if (failing.putIfAbsent(key, res.error) == null) log.warn "SolarEdge: ${what} failed: ${res.error} (logged again only once it works)"
-        return
-    }
-    if (failing.remove(key) != null) log.info "SolarEdge: ${what} works again"
+    // A failed login fails every request; its own status warning says so once.
+    if (res.login) return
+    noteFailure(key, what, res.error as String)
+    if (res.error) return
     String why = staleReason(req.kind as String, res.json, t)
     if (why) {
         if (stale.putIfAbsent(key, why) == null) log.warn "SolarEdge: ${what} looks stale: ${why}"
@@ -901,6 +909,16 @@ String staleReason(String kind, def json, long t) {
     return why ? why.join(", ") : null
 }
 
+/** Log once when `what` starts failing (error set) and once when it works again (error null). */
+private void noteFailure(String key, String what, String error) {
+    Map failing = runtimeMap("failing")
+    if (error) {
+        if (failing.putIfAbsent(key, error) == null) log.warn "SolarEdge: ${what} failed: ${error} (logged again only once it works)"
+    } else if (failing.remove(key) != null) {
+        log.info "SolarEdge: ${what} works again"
+    }
+}
+
 private Map runtimeMap(String name) {
     Map rt = runtime()
     Map m = rt[name]
@@ -921,6 +939,7 @@ private def defaultKwp() {
 /** Ask Forecast.Solar for each site with an inverter; once an hour (runEvery1Hour) and at setup. */
 void forecastRefresh() {
     if (!settings.forecastEnable) return
+    runtime().forecastAskedAt = now()
     def lat = location?.latitude
     def lon = location?.longitude
     if (lat == null || lon == null) {
@@ -935,7 +954,7 @@ void forecastRefresh() {
             logOnce("forecast no kwp ${siteId}", "solar forecast for site ${siteId} needs the system size (kWp) in the app settings")
             return
         }
-        String path = forecastPath(lat as double, lon as double, (settings.forecastTilt ?: DEFAULT_TILT) as int,
+        String path = forecastPath(lat as double, lon as double, (settings.forecastTilt != null ? settings.forecastTilt : DEFAULT_TILT) as int,
             (settings.forecastBearing != null ? settings.forecastBearing : DEFAULT_BEARING) as int, kwp as double)
         logDebug "Forecast for site ${siteId}: GET ${FORECAST_URL}${path}"
         asynchttpGet("forecastDone", [uri: FORECAST_URL, path: path, query: [time: "iso8601"], headers: [Accept: "application/json"],
@@ -954,20 +973,18 @@ def forecastDone(resp, Map data) {
     String siteId = data.siteId as String
     int status = statusOf(resp)
     def json = parseJsonText(bodyOf(resp))
-    Map failing = runtimeMap("failing")
     String key = "forecast:${siteId}".toString()
+    String what = "solar forecast for site ${siteId}"
     if (status != 200 || !(json instanceof Map) || !(json.result instanceof Map)) {
-        String msg = (json instanceof Map ? json.message?.text : null) ?: errorMessage(resp) ?: "HTTP ${status}"
-        if (failing.putIfAbsent(key, msg) == null) log.warn "SolarEdge: solar forecast for site ${siteId} failed: ${msg} (logged again only once it works)"
+        noteFailure(key, what, (json instanceof Map ? json.message?.text : null) ?: errorMessage(resp) ?: "HTTP ${status}")
         return
     }
-    if (failing.remove(key) != null) log.info "SolarEdge: solar forecast for site ${siteId} works again"
+    noteFailure(key, what, null)
     String tz = json.message?.info?.timezone ?: ((state.sites ?: [:])[siteId]?.tz) ?: location?.timeZone?.ID
-    Map fc = parseForecast(json.result, tz) + [fetchedAt: now()]
-    Map all = state.forecast ?: [:]
-    all[siteId] = fc
-    state.forecast = all
-    logDebug "Forecast for site ${siteId}: ${fc.days}"
+    // In memory, not state: this runs in its own execution, which would write back the
+    // state it loaded and undo a poll's battery totals saved meanwhile (or lose this).
+    runtimeMap("forecast")[siteId] = parseForecast(json.result, tz) + [fetchedAt: now()]
+    logDebug "Forecast for site ${siteId}: ${runtimeMap('forecast')[siteId].days}"
     // Shown right away, not only on the next poll.
     siteDevices().findAll { it.getDataValue("type") == "inverter" && it.getDataValue("siteId") == siteId }.each { cd ->
         cd.applyEvents(forecastEvents(siteId, now(), cd.currentValue("energyToday")))
@@ -975,58 +992,84 @@ def forecastDone(resp, Map data) {
 }
 
 /**
- * The parts of a Forecast.Solar `result` kept in state: Wh per day, and per
- * moment the power (W) and the day's energy so far (Wh). Times come as ISO 8601
- * (time=iso8601) or as local "yyyy-MM-dd HH:mm:ss" in the forecast's timezone.
+ * The parts of a Forecast.Solar `result` kept: Wh per day, and the power curve
+ * (W at moments) per day. Times come as ISO 8601 (time=iso8601) or as local
+ * "yyyy-MM-dd HH:mm:ss" in the forecast's timezone. The energy so far is worked
+ * out from the power curve, not from watt_hours, whose running total isn't
+ * documented to start over each day.
  */
 Map parseForecast(Map result, String tz) {
+    java.text.SimpleDateFormat local = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    local.setTimeZone(zone(tz))
     Closure ms = { String k ->
         Long v = parseIso(k)
         if (v != null && k.contains("T")) return v
-        try {
-            java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-            f.setTimeZone(zone(tz))
-            return f.parse(k).time
-        } catch (e) {
-            return null
+        try { return local.parse(k).time } catch (e) { return null }
+    }
+    Map watts = [:]
+    (result.watts ?: [:]).each { k, v ->
+        Long at = ms(k as String)
+        if (at != null && v instanceof Number) {
+            String day = dayIn(at, tz)
+            if (!watts[day]) watts[day] = []
+            watts[day] << [at, v as double]
         }
     }
-    Closure points = { Map m ->
-        (m ?: [:]).collect { k, v -> [ms(k as String), v] }.findAll { it[0] != null && it[1] instanceof Number }
-            .collect { [it[0] as long, (it[1] as double)] }.sort { it[0] }
-    }
+    watts.each { day, pts -> pts.sort { it[0] } }
     Map days = [:]
     (result.watt_hours_day ?: [:]).each { k, v -> if (v instanceof Number) days[(k as String).take(10)] = v as double }
-    return [tz: tz, days: days, watts: points(result.watts), cum: points(result.watt_hours)]
+    return [tz: tz, days: days, watts: watts]
+}
+
+/** The day after a "yyyy-MM-dd" date, by the calendar (not +24 h, which DST days break). */
+String nextDay(String day) {
+    java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyy-MM-dd")
+    f.setTimeZone(TimeZone.getTimeZone("UTC"))
+    return f.format(new Date(f.parse(day).time + 24 * 3600 * 1000L))
 }
 
 /**
  * The inverter's forecast events at `t`: today's and tomorrow's forecast (kWh),
- * the forecast power now (W), the forecast energy so far today (kWh), and the
- * actual energy today as % of that (once the forecast so far is 0.1 kWh or more).
+ * the forecast power now (W), the forecast energy so far today (kWh: the power
+ * curve integrated up to now, scaled to the day's total), and the actual energy
+ * today as % of that (once the forecast so far is 0.1 kWh or more).
  */
 List forecastEvents(String siteId, long t, def actualToday) {
     if (!settings.forecastEnable) return []
-    Map fc = (state.forecast ?: [:])[siteId]
+    Map fc = runtimeMap("forecast")[siteId]
     if (!fc) return []
-    String tz = fc.tz
-    String day = dayIn(t, tz)
-    String next = dayIn(t + 24 * 3600 * 1000L, tz)
+    String day = dayIn(t, fc.tz)
+    String next = nextDay(day)
     List out = []
     if (fc.days[day] != null) out << ev("forecastToday", round((fc.days[day] as double) / 1000, 2), "kWh")
     if (fc.days[next] != null) out << ev("forecastTomorrow", round((fc.days[next] as double) / 1000, 2), "kWh")
     // Only forecasts for today count for now and so far (an old one says nothing about today).
     if (fc.days[day] == null) return out
-    List watts = (fc.watts ?: []).findAll { dayIn(it[0] as long, tz) == day }
-    List cum = (fc.cum ?: []).findAll { dayIn(it[0] as long, tz) == day }
-    double powerNow = interpolate(watts, t, 0d, 0d)
-    out << ev("forecastPower", (Math.round(powerNow / 10) * 10) as int, "W")
-    double soFar = interpolate(cum, t, 0d, fc.days[day] as double)
+    List pts = fc.watts[day] ?: []
+    out << ev("forecastPower", (Math.round(interpolate(pts, t, 0d, 0d) / 10) * 10) as int, "W")
+    double whole = integrate(pts, Long.MAX_VALUE)
+    double soFar = whole > 0 ? integrate(pts, t) / whole * (fc.days[day] as double) : 0d
     out << ev("forecastSoFar", round(soFar / 1000, 2), "kWh")
     if (actualToday instanceof Number && soFar >= 100) {
         out << ev("actualVsForecast", Math.round((actualToday as double) * 1000 / soFar * 100) as int, "%")
     }
     return out
+}
+
+/** Wh under a power curve ([ms, W] points) up to `t`: trapezoids, the last one cut at t. */
+private double integrate(List pts, long t) {
+    double wh = 0d
+    for (int i = 1; i < pts.size(); i++) {
+        long t0 = pts[i - 1][0] as long
+        long t1 = pts[i][0] as long
+        if (t <= t0) break
+        double w0 = pts[i - 1][1] as double
+        double w1 = pts[i][1] as double
+        long end = Math.min(t, t1)
+        double wEnd = t1 == t0 ? w1 : w0 + (w1 - w0) * (end - t0) / (t1 - t0)
+        wh += (w0 + wEnd) / 2 * (end - t0) / 3600000d
+    }
+    return wh
 }
 
 /** Linear between [ms, value] points; `before` / `after` outside them. */
@@ -1118,8 +1161,10 @@ List eventsFor(def cd, String type, String siteId, Map by, long t) {
             List inv = inverterEvents(j("powerflow:${siteId}"), [overview: j("energyOverview:${siteId}"), inverters: j("inverters:${siteId}"),
                 byInverter: j("byInverter:${siteId}"), communication: j("communication:${siteId}"), alerts: j("alerts:${siteId}"),
                 cadenceMs: timing().cadenceMs, nowMs: t, scale: location.temperatureScale])
-            def today = inv.find { it.name == "energyToday" }?.value ?: cd.currentValue("energyToday")
-            return inv + forecastEvents(siteId, t, today)
+            // On energy ticks only, together with the energyToday they compare against.
+            Map todayEv = inv.find { it.name == "energyToday" }
+            if (!todayEv) return inv
+            return inv + forecastEvents(siteId, t, todayEv.value)
         case "meter":
             int y = yearIn(t, site.tz)
             return meterEvents(j("powerflow:${siteId}"), [communication: j("communication:${siteId}"), totals: meterTotals(siteId, y), asleep: asleep])

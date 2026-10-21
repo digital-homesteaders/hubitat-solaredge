@@ -43,11 +43,12 @@ Every device on a site is fed from the same answers:
   tick that still finds a poll in flight runs as soon as that poll is done.
 - An inverter-only site skips the 60-second polls at night and is read only
   on the 5-minute energy tick until the sun is back.
-- An EV charger that isn't charging gets its plug status from the power flow
+- A single EV charger that isn't charging gets its plug status from the power flow
   and its devices-list entry on the 5-minute tick. When the power flow shows
   a charge starting, the next poll reads the list again, every minute while
   it charges. That saves about 1,150 requests a day while the car isn't
-  charging.
+  charging. A site with several chargers reads the list every poll, since
+  the power flow's charger status is one per site.
 - A site with an inverter, meter and battery makes **about 2,890 requests a
   day** at the 60 s default, measured over a simulated day that follows the
   app's own timers (about 4,420 with an EV charger and a load controller as
@@ -153,8 +154,11 @@ no account.
 - **What it gets:** once an hour, the hub's location (from Settings >
   Location, rounded to about 1 km), the panel tilt, the direction they face
   and the system size.
-- **What comes back:** the expected power through today and tomorrow, which
-  the app stores and reads at every poll.
+- **What comes back:** the expected power through today and tomorrow. The app
+  keeps it in memory (after a hub restart it asks again) and updates the
+  forecast values on every 5-minute energy tick, together with
+  `energyToday`, so actual vs forecast compares the same moment.
+- **Turning it off** removes the forecast values from the inverter.
 - **Settings:** the system size defaults to the peak power SolarEdge reports
   (on an existing install, open **Choose devices** once so the app reads it,
   or enter it). Tilt defaults to 30° and direction to 180° (south); set

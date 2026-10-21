@@ -236,6 +236,7 @@ class FakeDevice {
     void updateDataValue(String k, def v) { data[k] = v?.toString() }
     def currentValue(String attr, boolean skipCache = false) { current[attr] }
     void updateSetting(String name, def v) { driver.settings[name] = v instanceof Map ? v.value : v }
+    void deleteCurrentState(String attr) { current.remove(attr) }
 
     void applyEvent(Map e) {
         events << new LinkedHashMap(e)

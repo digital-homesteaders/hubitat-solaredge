@@ -829,11 +829,18 @@ check("solar forecast: hourly from Forecast.Solar, on the inverter and its summa
     assert inv.current.forecastToday == 34.14 && inv.current.forecastTomorrow == 28.67
     assert inv.current.forecastPower == 4990 && inv.current.actualVsForecast == 45
     assert inv.current.summary.contains("forecast 34.1 kWh, tomorrow 28.7 kWh · 45 % of forecast so far")
-    // The polls keep it current without asking Forecast.Solar again.
-    hub.clock += 30 * 60000L
+    // The energy ticks keep it current without asking Forecast.Solar again; plain polls leave it.
+    fastTick()                               // the energy tick updated() asked for
+    int fcEvents = inv.events.count { it.name.startsWith("forecast") }
     calls = fastTick()
+    assert inv.events.count { it.name.startsWith("forecast") } == fcEvents
+    hub.clock += 30 * 60000L
+    app.energyTick(); hub.settle()
+    calls = serve()
     assert !calls.any { it[2].uri == "https://api.forecast.solar" }
     assert inv.current.forecastPower > 4500 && inv.current.forecastSoFar > 15.74
+    // Stored in memory, not in state (whose write-back would race with the polls).
+    assert !app.state.containsKey("forecast") && app.runtimeMap("forecast")[SITE]
     // Settings: size and direction.
     app.settings.forecastKwp = 6.5
     app.settings.forecastBearing = 135
@@ -848,10 +855,60 @@ check("solar forecast: hourly from Forecast.Solar, on the inverter and its summa
     override = { call -> call[2].uri == "https://api.forecast.solar" ? ok(answer) : null }
     app.forecastRefresh(); serve()
     assert app.log.at("info").any { it.contains("solar forecast for site ${SITE} works again") }
-    // Turned off: no more forecast, and its state goes.
+    // Tilt 0 (flat roof) is sent as 0, not the default.
+    app.settings.forecastTilt = 0
+    app.forecastRefresh()
+    assert app.callsNamed("asynchttpGet").last()[2].path == "/estimate/52.37/4.89/0/-45/6.5"
+    serve()
+    // Lost with a restart (memory only): the next poll asks again, once.
+    app.runtimeMap("forecast").clear()
+    app.runtime().forecastAskedAt = hub.clock - 11 * 60000L
+    fastTick()
+    assert app.callsNamed("runIn").count { it[2] == "forecastRefresh" && (it[4] as long) == hub.clock } == 1
+    fastTick()
+    assert app.callsNamed("runIn").count { it[2] == "forecastRefresh" && (it[4] as long) >= hub.clock - 60000L } == 1
+    // Turned off: the inverter drops the forecast values and its summary no longer shows them.
     app.settings.forecastEnable = false
     app.updated(); hub.settle()
-    assert !app.state.containsKey("forecast")
+    assert app.runtimeMap("forecast").isEmpty()
+    assert inv.current.forecastToday == null && inv.current.actualVsForecast == null
+    assert !inv.current.summary.contains("forecast")
+}
+
+check("a rejected login is one warning, not one per request") {
+    fresh()
+    install()
+    override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 200, data: "<html><input name='j_password'></html>") : null }
+    app.runtime().cookies = []
+    fastTick()
+    List warns = app.log.at("warn")
+    assert warns.count { it.contains("rejected") } == 1
+    assert !warns.any { it.contains(" failed: Invalid") }
+}
+
+check("two EV chargers on a site: the devices list every poll") {
+    fresh()
+    String devs = app.reqSiteDevices(SITE).key
+    Map two = new JsonSlurper().parseText(JsonOutput.toJson(replay[devs]))
+    Map second = new JsonSlurper().parseText(JsonOutput.toJson(two.devicesByType.EV_CHARGER[0]))
+    second.reporterId = 2000002
+    second.name = "Second charger"
+    second.connectionStatus = "DISCONNECTED"
+    second.chargerStatusSubTitle = []
+    two.devicesByType.EV_CHARGER[0].connectionStatus = "CONNECTED"
+    two.devicesByType.EV_CHARGER[0].chargerStatusSubTitle = []
+    two.devicesByType.EV_CHARGER << second
+    replay[devs] = two
+    String pf = app.reqPowerflow(SITE).key
+    replay[pf] = replay[pf] + [evCharger: [isActive: true, connectionStatus: "connected", currentPower: null]]
+    app.mainPage(); app.devicesPage(); serve()
+    app.settings.selectedDevices = ["solaredge-${SITE}-ev-1000001479067354".toString(), "solaredge-${SITE}-ev-2000002".toString()]
+    app.installed(); hub.settle()
+    app.tick(); hub.settle(); serve()
+    3.times { assert gets(fastTick(), "v1.0/sites/") == 1 }
+    assert child("ev-1000001479067354").current.chargingState == "plugged_in"
+    assert child("ev-2000002").current.chargingState == "plugged_out"
+    assert child("ev-2000002").events.count { it.name == "chargingState" } == 1, "no flip-flop"
 }
 
 check("poll interval: default 60 s, clamped to 30-300") {

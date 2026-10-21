@@ -332,6 +332,7 @@ check("devices list: every poll with a load controller or a charging EV, else on
     assert app.devicesDue([ev("plugged_out")], true)
     assert !app.devicesDue([[type: "inverter"], [type: "battery"]], true)
     assert app.devicesDue([ev("plugged_out"), ev("plugged_in_charging")], false)
+    assert app.devicesDue([ev("plugged_out"), ev("plugged_in")], false), "two chargers: only the list tells them apart"
 }
 
 // ---------------------------------------------------------------- solar forecast
@@ -341,8 +342,7 @@ check("devices list: every poll with a load controller or a charging EV, else on
 /** The forecast events at time t, with the sample answer stored for site 1. */
 Map forecastAt(long t, def actual) {
     app.settings.forecastEnable = true
-    app.state.forecast = ["1": app.parseForecast(forecastAnswer.result, "Europe/Amsterdam")]
-    hub.settle()
+    app.runtimeMap("forecast")["1"] = app.parseForecast(forecastAnswer.result, "Europe/Amsterdam")
     Map v = evs(app.forecastEvents("1", t, actual))
     app.settings.remove("forecastEnable")
     return v
@@ -355,6 +355,7 @@ check("forecast path: location rounded to ~1 km, azimuth from south, tilt kept i
     assert app.forecastPath(52.3731339d, 4.8903147d, 35, 90, 8.25d) == "/estimate/52.37/4.89/35/-90/8.25"
     assert app.forecastPath(-33.86d, 151.21d, 95, 270, 5d) == "/estimate/-33.86/151.21/90/90/5"
     assert app.forecastPath(40d, -74d, 20, 0, 6.4d) == "/estimate/40.00/-74.00/20/-180/6.4"
+    assert app.forecastPath(40d, -74d, 0, 180, 6.4d) == "/estimate/40.00/-74.00/0/0/6.4", "flat panels"
 }
 
 check("forecast at midday: today, tomorrow, power now, so far, actual vs forecast") {
@@ -380,12 +381,40 @@ check("forecast before sunrise, after sunset, and the next day") {
 
 check("forecast times as local 'yyyy-MM-dd HH:mm:ss' are read in the forecast's timezone") {
     Map fc = app.parseForecast([watts: ["2026-10-15 13:00:00": 4985], watt_hours: [:], watt_hours_day: ["2026-10-15": 34136]], "Europe/Amsterdam")
-    assert fc.watts == [[iso("2026-10-15T13:00:00+02:00"), 4985d]]
+    assert fc.watts == ["2026-10-15": [[iso("2026-10-15T13:00:00+02:00"), 4985d]]]
     assert fc.days == ["2026-10-15": 34136d]
 }
 
+check("forecast so far comes from the power curve, whatever watt_hours does") {
+    Map before = forecastAt(captured, 7.131)
+    // A watt_hours that keeps counting across days (or is missing) changes nothing.
+    Map changed = new JsonSlurper().parseText(groovy.json.JsonOutput.toJson(forecastAnswer))
+    changed.result.watt_hours = changed.result.watt_hours.collectEntries { k, v -> [(k): (v as long) + 99999] }
+    app.settings.forecastEnable = true
+    app.runtimeMap("forecast")["1"] = app.parseForecast(changed.result, "Europe/Amsterdam")
+    assert evs(app.forecastEvents("1", captured, 7.131)) == before
+    app.settings.remove("forecastEnable")
+}
+
+check("forecast tomorrow by the calendar, also on the day the clocks go back") {
+    assert app.nextDay("2026-10-15") == "2026-10-16"
+    assert app.nextDay("2026-12-31") == "2027-01-01"
+    assert app.nextDay("2026-10-25") == "2026-10-26"
+    assert app.nextDay("2028-02-28") == "2028-02-29"
+    // 00:30 on the 25-hour day (Europe/Amsterdam, 2026-10-25): +24 h would still be the 25th.
+    app.settings.forecastEnable = true
+    app.runtimeMap("forecast")["1"] = [tz: "Europe/Amsterdam", days: ["2026-10-25": 20000d, "2026-10-26": 30000d], watts: [:]]
+    Map v = evs(app.forecastEvents("1", iso("2026-10-25T00:30:00+02:00"), 0))
+    assert v.forecastToday == 20 && v.forecastTomorrow == 30
+    app.settings.remove("forecastEnable")
+}
+
+check("forecast: an actual of 0 counts as 0 %") {
+    assert forecastAt(captured, 0).actualVsForecast == 0
+}
+
 check("forecast off: no forecast events") {
-    app.state.forecast = ["1": app.parseForecast(forecastAnswer.result, "Europe/Amsterdam")]
+    app.runtimeMap("forecast")["1"] = app.parseForecast(forecastAnswer.result, "Europe/Amsterdam")
     assert app.forecastEvents("1", captured, 7.131) == []
 }
 

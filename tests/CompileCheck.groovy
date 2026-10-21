@@ -50,10 +50,12 @@ check("child device methods called by the app exist and are public in every driv
     String text = new File(root, "apps/solaredge-connect.groovy").text
     List<String> builtIn = ["getDataValue", "updateDataValue", "currentValue", "getDeviceNetworkId", "getDisplayName"]
     List<String> called = (text =~ /\bcd\??\.(\w+)\s*\(/).collect { it[1] }.unique() - builtIn
-    assert called == ["applyEvents"]
+    assert called.sort() == ["applyEvents", "clearForecast"]
     new File(root, "drivers").listFiles().findAll { it.name.endsWith(".groovy") }.each { File f ->
         assert isPublic(hub.compile(f), "applyEvents"), f.name
     }
+    // clearForecast is only called on inverters.
+    assert isPublic(hub.compile(new File(root, "drivers/solaredge-inverter.groovy")), "clearForecast")
 }
 
 check("every driver the app creates exists") {
