@@ -254,9 +254,13 @@ void initialize() {
     if (rt.credKey != credKey) {
         rt.credKey = credKey
         rt.cookies = []
-        rt.loginBlockedUntil = 0L
-        rt.loginRetryMs = 0L
     }
+    // Done in the app retries now: no login hold or outage pause carries over (the
+    // status after a failure says so).
+    rt.loginBlockedUntil = 0L
+    rt.loginRetryMs = 0L
+    rt.backoffUntil = 0L
+    rt.outages = 0
     if (settings.logEnable) runIn(1800, "logsOff")
     syncChildren()
     state.timing = timing()

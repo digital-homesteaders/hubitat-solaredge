@@ -483,6 +483,27 @@ check("a login redirected back to the login page is a rejection, not a session")
     assert app.state.discovered.size() == 5
 }
 
+check("Done in the app retries at once after a held login or an outage pause") {
+    fresh()
+    install()
+    Map rt = app.runtime()
+    // Logins held after a failure, and polls paused after an outage.
+    rt.cookies = []
+    rt.loginRetryMs = 240000L
+    rt.loginBlockedUntil = hub.clock + 240000L
+    rt.backoffUntil = hub.clock + 600000L
+    hub.clock += 60000
+    app.tick(); hub.settle()
+    assert serve() == []
+    int logins = app.callsNamed("asynchttpPost").size()
+    app.updated(); hub.settle()                  // the user presses Done, same credentials
+    app.tick(); hub.settle()
+    List calls = serve()
+    assert app.callsNamed("asynchttpPost").size() == logins + 1 && gets(calls, "powerflow") == 1
+    assert rt.loginRetryMs == 0 && rt.backoffUntil == 0
+    assert child("inverter").current.healthStatus == "online"
+}
+
 check("a login that fails on SolarEdge's side is an outage, not a rejection") {
     fresh()
     override = { call -> call[0] == "asynchttpPost" ? new FakeResp(status: 503, data: "") : null }
