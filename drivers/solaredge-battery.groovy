@@ -28,7 +28,7 @@ metadata {
         attribute "healthStatus", "enum", ["online", "offline"]
     }
     preferences {
-        input "txtEnable", "bool", title: "Description text logging", defaultValue: true
+        input "txtEnable", "bool", title: "Description text logging (state changes; power and energy readings only in debug logging)", defaultValue: true
         input "logEnable", "bool", title: "Debug logging (turns itself off after 30 minutes)", defaultValue: false
     }
 }
@@ -60,7 +60,7 @@ void applyEvents(List events) {
         if (e.value == null || same(device.currentValue(e.name as String), e.value)) return
         Map evt = new LinkedHashMap(e)
         evt.descriptionText = "${device.displayName} ${e.name} is ${e.value}${e.unit ? ' ' + e.unit : ''}"
-        if (txtEnable) log.info evt.descriptionText
+        if (txtEnable && !quiet(e.name as String)) log.info evt.descriptionText
         if (logEnable) log.debug "${device.displayName}: ${e.name} ${device.currentValue(e.name as String)} -> ${e.value}"
         sendEvent(evt)
     }
@@ -76,6 +76,17 @@ private boolean same(def current, def value) {
         return false
     }
     return current.toString() == value.toString()
+}
+
+/**
+ * Values that change on almost every poll are not info-logged (debug logging
+ * still shows them); state changes are. Their events keep a description.
+ */
+private boolean quiet(String name) {
+    name in ["power", "energy", "energyToday", "energyMonth", "energyYear", "energyLifetime", "energyCharged",
+        "energyDischarged", "energyImported", "energyExported", "energyImportedYear", "energyExportedYear",
+        "residualEnergy", "sessionEnergy", "sessionDuration", "gridPower", "solarPower", "loadPower", "batteryPower",
+        "voltage", "voltageL1", "voltageL2", "voltageL3", "optimizerTemperatureMax"]
 }
 
 // ---------------------------------------------------------------- summary

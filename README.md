@@ -31,7 +31,7 @@ Every device on a site is fed from the same answers:
 
 | When | Requests per site |
 | --- | --- |
-| Every poll (default 60 s, 30–300 s) | 1 power flow, for all devices on the site. If you have EV chargers or load controllers, also 1 devices list for all of them. |
+| Every poll (default 60 s, 30–300 s) | 1 power flow, for all devices on the site. Also 1 devices list for all EV chargers and load controllers, but for EV chargers only while one is charging. |
 | Energy tick, every 5 min, just after the inverters upload | energy overview, inverter details (all inverters in one call), batteries, this year's meter totals |
 | Every third energy tick (15 min) | site alerts and connectivity, optimizer temperatures, EV charging history |
 | Once | the meter's past years, one per poll, then kept |
@@ -43,6 +43,11 @@ Every device on a site is fed from the same answers:
   tick that still finds a poll in flight runs as soon as that poll is done.
 - An inverter-only site skips the 60-second polls at night and is read only
   on the 5-minute energy tick until the sun is back.
+- An EV charger that isn't charging gets its plug status from the power flow
+  and its devices-list entry on the 5-minute tick. When the power flow shows
+  a charge starting, the next poll reads the list again, every minute while
+  it charges. That saves about 1,150 requests a day while the car isn't
+  charging.
 - A site with an inverter, meter and battery makes **about 2,890 requests a
   day** at the 60 s default, measured over a simulated day that follows the
   app's own timers (about 4,420 with an EV charger and a load controller as
@@ -154,7 +159,7 @@ device also has a **`summary`** attribute: one line with units, for example
 | Battery `battery` | charge level % |
 | PowerMeter `power` | charging positive, discharging negative |
 | `chargingState` | charging, discharging, idle |
-| `energyCharged`, `energyDischarged` (EnergyMeter `energy` = discharged) | integrated from the battery power at every poll; see below |
+| `energyCharged`, `energyDischarged` (EnergyMeter `energy` = discharged) | integrated from the battery power at every poll, shown in 0.01 kWh steps; see below |
 | `residualEnergy`, `stateOfHealth` | stored kWh, summed over the batteries; full-pack capacity as % of the nameplate. Read on the 5-minute energy tick. |
 | `siteConnectivity` | online/offline. Offline is not reported while the inverters sleep. |
 
@@ -202,6 +207,11 @@ SolarEdge Home Battery 400V (`tests/fixtures/batteries-two.json`).
     for over 10 minutes
   - "… failed: HTTP 500", for any request that fails while the rest of the
     poll works
+- **Description text logging** (on by default) logs state changes, such as
+  charging/idle, plugged in, switch, battery % and inverter status. Power and
+  energy readings, which change on almost every poll, appear only in debug
+  logging, but their events still carry a description in the device's
+  event history.
 - **Log raw SolarEdge data** (button in the app, under Logging) asks for each
   site's power flow, devices list, batteries and inverters right away and
   writes the answers to Logs, split into numbered pieces. Vehicle and network

@@ -228,8 +228,8 @@ check("unchanged values send no events; past years are not fetched again") {
     assert calls.size() == 2
     assert child("battery").events.last().name == "energyCharged"
     assert app.getChildDevices().sum { it.events.size() } == before + 1, "the summary still reads 0.0 kWh: no event"
-    // 500 W for two 60 s polls since the first one
-    assert child("battery").current.energyCharged == 0.017
+    // 500 W for two 60 s polls since the first one: 0.017 kWh, shown as 0.02
+    assert child("battery").current.energyCharged == 0.02
 }
 
 check("an energy tick that lands on a tick in flight still runs (state written back by its answers)") {
@@ -761,6 +761,51 @@ check("Log raw SolarEdge data: each answer logged in pieces, identifiers hidden"
     assert app.log.at("info").any { it.startsWith("SolarEdge: raw powerflow site ${SITE}, ") }
     // It doesn't disturb the poll: no tick is left running.
     assert app.runtime().tick == null
+}
+
+check("EV charger unplugged: devices list on energy ticks only; a charge in the power flow brings it back") {
+    fresh()
+    String pf = app.reqPowerflow(SITE).key
+    String devs = app.reqSiteDevices(SITE).key
+    Map unplugged = new JsonSlurper().parseText(JsonOutput.toJson(replay[devs]))
+    unplugged.devicesByType.EV_CHARGER[0].connectionStatus = "DISCONNECTED"
+    unplugged.devicesByType.EV_CHARGER[0].chargerStatusSubTitle = []
+    replay[devs] = unplugged
+    Map flow = replay[pf]
+    replay[pf] = flow + [evCharger: [isActive: true, connectionStatus: "disconnected", currentPower: null]]
+    app.mainPage(); app.devicesPage(); serve()
+    app.settings.selectedDevices = ["solaredge-${SITE}-inverter".toString(), "solaredge-${SITE}-ev-1000001479067354".toString()]
+    app.installed(); hub.settle()
+    app.tick(); hub.settle(); serve()                       // first (energy) poll reads it
+    FakeDevice ev = child("ev-1000001479067354")
+    assert ev.current.chargingState == "plugged_out"
+    List calls = fastTick()
+    assert gets(calls, "v1.0/sites/") == 0 && gets(calls, "powerflow") == 1
+    hub.clock += 300000
+    app.energyTick(); hub.settle()
+    assert gets(serve(), "v1.0/sites/") == 1, "energy tick still reads it"
+    // The car starts charging: the power flow shows it first.
+    replay[pf] = flow + [evCharger: [isActive: true, connectionStatus: "charging", currentPower: 7.2]]
+    calls = fastTick()
+    assert gets(calls, "v1.0/sites/") == 0
+    assert ev.current.chargingState == "plugged_in_charging" && ev.current.power == 7200
+    calls = fastTick()
+    assert gets(calls, "v1.0/sites/") == 1, "while charging, every poll"
+    assert unknown == []
+}
+
+check("info log: state changes only; power and energy readings in debug") {
+    fresh()
+    install()
+    FakeDevice bat = child("battery")
+    List info = bat.driver.log.at("info")
+    assert info.any { it.contains("chargingState is charging") } && info.any { it.contains("battery is 62 %") }
+    assert !info.any { it =~ /power is|energyCharged|residualEnergy|energy is/ }
+    assert bat.lastEvent("power").descriptionText == "Synthetic site Battery power is 500 W", "events keep their description"
+    bat.driver.settings.logEnable = true
+    child("battery").applyEvents([[name: "power", value: 750, unit: "W"]])
+    assert bat.driver.log.at("debug").any { it.contains("power 500 -> 750") }
+    assert !bat.driver.log.at("info").any { it.contains("power is 750") }
 }
 
 check("poll interval: default 60 s, clamped to 30-300") {

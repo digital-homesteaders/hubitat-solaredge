@@ -183,17 +183,19 @@ check("battery flow: integrated per poll, not across a long gap, kept across res
     Closure poll = { int w, long at -> evs(app.batteryEvents("bf", [storage: [currentPower: Math.abs(w) / 1000d, status: w < 0 ? "discharging" : w > 0 ? "charging" : "idle"]], null, null, false, at)) }
     assert poll(-10000, t).energyDischarged == 0
     // 10 kW out for one minute, then 2 kW in for one minute (crossing zero on the way)
-    assert poll(-10000, t + 60000).energyDischarged == 0.167
+    assert poll(-10000, t + 60000).energyDischarged == 0.17
     Map v = poll(2000, t + 120000)
-    assert v.energyCharged == 0.003 && v.energyDischarged == 0.236
+    // Shown in 0.01 kWh steps; the total behind it is exact (0.236 discharged, 0.003 charged).
+    assert v.energyCharged == 0 && v.energyDischarged == 0.24
+    assert Math.abs((app.state.flow.bf.discharged as double) - 0.2361) < 0.0001
     // The totals are plain state, so they come through the hub's JSON (a restart).
     hub.settle()
     // A 15-minute gap (an outage) adds nothing; the next minute counts again.
-    assert poll(2000, t + 120000 + 15 * 60000).energyCharged == 0.003
-    assert poll(2000, t + 120000 + 16 * 60000).energyCharged == 0.036
+    assert poll(2000, t + 120000 + 15 * 60000).energyCharged == 0
+    assert poll(2000, t + 120000 + 16 * 60000).energyCharged == 0.04
     // At a 300 s poll, three intervals (15 min) still count.
     app.settings.pollSeconds = 300
-    assert poll(2000, t + 120000 + 31 * 60000).energyCharged == 0.536
+    assert poll(2000, t + 120000 + 31 * 60000).energyCharged == 0.54
     app.settings.remove("pollSeconds")
 }
 
@@ -318,6 +320,18 @@ check("raw data: vehicle and network identifiers hidden, the rest kept") {
     assert ev.applianceData.siteApplianceUUID == "(hidden)" && r.rfIdCardsListSupported == "(hidden)"
     assert ev.reporterId == 1000001479067354 && ev.applianceData.alias == "Ioniq" && ev.sessionEnergy == 93
     assert resp.devicesByType.EV_CHARGER[0].applianceData.physicalId == "XXX-0000", "the answer itself is untouched"
+}
+
+check("devices list: every poll with a load controller or a charging EV, else on energy ticks") {
+    Closure ev = { String st -> [type: "ev", chargingState: st] }
+    assert app.devicesDue([[type: "hlc"]], false)
+    assert app.devicesDue([ev("plugged_in_charging")], false)
+    assert app.devicesDue([ev(null)], false), "state not known yet"
+    assert !app.devicesDue([ev("plugged_out")], false)
+    assert !app.devicesDue([ev("plugged_in")], false)
+    assert app.devicesDue([ev("plugged_out")], true)
+    assert !app.devicesDue([[type: "inverter"], [type: "battery"]], true)
+    assert app.devicesDue([ev("plugged_out"), ev("plugged_in_charging")], false)
 }
 
 check("ISO times") {

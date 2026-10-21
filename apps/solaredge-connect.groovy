@@ -665,7 +665,8 @@ def tick() {
         slow = (rt.energyCount as int) % SLOW_EVERY == 1
     }
     List reqs = planTick(devices.collect { [type: it.getDataValue("type"), siteId: it.getDataValue("siteId"),
-        reporterId: it.getDataValue("reporterId"), serials: it.getDataValue("serials")] }, energy, slow)
+        reporterId: it.getDataValue("reporterId"), serials: it.getDataValue("serials"),
+        chargingState: it.getDataValue("type") == "ev" ? it.currentValue("chargingState") : null] }, energy, slow)
     if (!reqs) return
 
     Map tk = new ConcurrentHashMap([started: now(), results: new ConcurrentHashMap(),
@@ -690,7 +691,7 @@ List planTick(List devices, boolean energy, boolean slow) {
         // Only inverters on this site, and the sun is down: the energy tick is enough.
         boolean nightSkip = types == (["inverter"] as Set) && (state.solarIdle ?: [:])[siteId] && !energy
         if (!nightSkip) add(reqPowerflow(siteId), [kind: "powerflow", siteId: siteId])
-        if (types.contains("ev") || types.contains("hlc")) add(reqSiteDevices(siteId), [kind: "siteDevices", siteId: siteId])
+        if (devicesDue(devs, energy)) add(reqSiteDevices(siteId), [kind: "siteDevices", siteId: siteId])
         if (energy) {
             if (types.contains("inverter")) {
                 add(reqEnergyOverview(siteId), [kind: "energyOverview", siteId: siteId])
@@ -726,6 +727,20 @@ List planTick(List devices, boolean energy, boolean slow) {
         }
     }
     return new ArrayList(out.values())
+}
+
+/**
+ * Whether this poll needs the site's devices list. Load controllers need it every
+ * poll. EV chargers only while one charges (or its state is unknown yet), for its
+ * own power and the session; otherwise the power flow has their plug status, and
+ * the list is read on the energy tick. A charge that starts shows in the power
+ * flow first, and the next poll reads the list again.
+ */
+boolean devicesDue(List devs, boolean energy) {
+    if (devs.any { it.type == "hlc" }) return true
+    List evs = devs.findAll { it.type == "ev" }
+    if (!evs) return false
+    return energy || evs.any { it.chargingState == null || it.chargingState == "plugged_in_charging" }
 }
 
 private List serialsOf(List devs) {
@@ -1379,8 +1394,10 @@ List batteryEvents(String dni, Map pf, Map batteriesResp, Map communication = nu
         if (p != null && status == "discharging") p = -p
         out << ev("power", p ?: 0, "W")
         Map flow = batteryFlow(dni, p ?: 0, nowMs ?: now())
-        BigDecimal discharged = round(flow.discharged, 3)
-        out << ev("energyCharged", round(flow.charged, 3), "kWh")
+        // In 0.01 kWh steps: the totals (kept unrounded) move a little on every poll,
+        // and an event for each 0.004 kWh is noise.
+        BigDecimal discharged = round(flow.discharged, 2)
+        out << ev("energyCharged", round(flow.charged, 2), "kWh")
         out << ev("energyDischarged", discharged, "kWh")
         out << ev("energy", discharged, "kWh")
         if (st.chargeLevel instanceof Number) out << ev("battery", Math.round(st.chargeLevel as double) as int, "%")
