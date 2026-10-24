@@ -77,13 +77,20 @@ preferences {
 @Field static final long ENERGY_MERGE_MS = 15 * 1000L
 // Solar forecast (https://forecast.solar, free public API, no account).
 @Field static final String FORECAST_URL = "https://api.forecast.solar"
+// Or Open-Meteo (https://open-meteo.com, free, no account): sunlight on the panels, made into power here.
+@Field static final String OPEN_METEO_URL = "https://api.open-meteo.com"
+@Field static final Map FORECAST_SOURCES = [openmeteo: "Open-Meteo", forecastsolar: "Forecast.Solar"]
+// Watts per kWp per W/m² of sunlight on the panels: losses to heat, wiring and the inverter, before any learning.
+@Field static final double OPEN_METEO_RATIO = 0.85
+// The other source stands in once the chosen one has failed this long (its third hourly round; a few minutes' slack for the schedule).
+@Field static final long FALLBACK_AFTER_MS = 2 * 3600 * 1000L - 5 * 60000L
+// Grid power within this many watts either way is idle: a battery holds the grid near 0 W, a few watts either side.
+@Field static final int GRID_IDLE_W = 100
 @Field static final int DEFAULT_TILT = 30
 // Compass bearing the panels face; 180 = south. Forecast.Solar counts from south (-90 east, 90 west).
 @Field static final int DEFAULT_BEARING = 180
 // The location sent is rounded to this many decimals (about 1 km).
 @Field static final int FORECAST_DECIMALS = 2
-// Grid power within this many watts either way is idle: a battery holds the grid near 0 W, a few watts either side.
-@Field static final int GRID_IDLE_W = 100
 // A devices list SolarEdge last updated longer ago than this counts as stale.
 @Field static final long STALE_DATA_MS = 10 * 60 * 1000L
 // Hubitat log lines are kept short: raw answers are logged in pieces of this size.
@@ -178,15 +185,36 @@ def mainPage() {
                 "alerts, optimizer temperatures and EV charging history every 15 minutes."
         }
         section("Solar forecast") {
-            input "forecastEnable", "bool", title: "Solar forecast from Forecast.Solar", defaultValue: false, submitOnChange: true
+            input "forecastEnable", "bool", title: "Solar forecast", defaultValue: false, submitOnChange: true
             if (settings.forecastEnable) {
-                input "forecastKwp", "decimal", title: "System size (kWp)${defaultKwp() ? ', default ' + defaultKwp() + ' from SolarEdge' : ''}", required: false
-                input "forecastTilt", "number", title: "Panel tilt (degrees, 0 flat to 90 upright)", range: "0..90", defaultValue: DEFAULT_TILT, required: false
-                input "forecastBearing", "number", title: "Direction the panels face (compass degrees: 90 east, 180 south, 270 west)",
-                    range: "0..359", defaultValue: DEFAULT_BEARING, required: false
-                paragraph "Once an hour, the hub's location (rounded to about 1 km), the tilt, direction and size go to " +
-                    "api.forecast.solar, which answers with the expected solar power for today and tomorrow. Free, no account. " +
+                input "forecastSource", "enum", title: "Forecast from", options: ["openmeteo": "Open-Meteo (default)", "forecastsolar": "Forecast.Solar"],
+                    defaultValue: "openmeteo", required: false
+                input "forecastKwp", "decimal", title: "System size in kW, all panels together (kWp)", required: false
+                paragraph "The number of panels times the watts of one panel, divided by 1000: 20 panels of 400 W are 8 kW. " +
+                    "The watts are on the panel's label and in the installer's quote. " +
+                    (defaultKwp() ? "Leave it empty to use the ${defaultKwp()} kW SolarEdge reports." :
+                        "SolarEdge's figure isn't known yet: open Choose devices once and it's used when this is empty.")
+                input "forecastFaces", "enum", title: "Roof faces with panels", options: ["1": "1", "2": "2 (east and west, say)", "3": "3"],
+                    defaultValue: "1", required: false, submitOnChange: true
+                int faces = faceCount()
+                (1..faces).each { int i ->
+                    String which = faces > 1 ? " on face ${i}" : ""
+                    if (faces > 1) input "forecastPanels${i}", "number", title: "Number of panels on face ${i}", range: "1..1000", required: false
+                    input faceSetting("forecastTilt", i), "number", title: "Panel tilt${which} (degrees, 0 flat to 90 upright)", range: "0..90",
+                        defaultValue: DEFAULT_TILT, required: false
+                    input faceSetting("forecastBearing", i), "number",
+                        title: "Direction the panels${which} face (compass degrees: 90 east, 180 south, 270 west)",
+                        range: "0..359", defaultValue: DEFAULT_BEARING, required: false
+                }
+                if (faces > 1) paragraph "The system size is shared between the faces by their number of panels (evenly while one is empty). " +
+                    "Each face is its own request, and the forecasts are added up."
+                paragraph "Once an hour, the hub's location (rounded to about 1 km) and the panels' tilt and direction go to the forecast service " +
+                    "(Forecast.Solar also gets the size), which answers with the expected sunlight or solar power for today and tomorrow. " +
+                    "Both are free, without an account. When one fails for 2 hours the other stands in. " +
                     "The inverter then shows forecastToday, forecastTomorrow, forecastPower (now) and actualVsForecast (today so far)."
+                String learned = learnedSummary()
+                paragraph "<b>Learning:</b> each evening the day's production is compared with its forecast, and later forecasts are " +
+                    "corrected by it (shade, losses and settings that are a little off). " + (learned ?: "Nothing learned yet: that takes a fairly sunny day.")
             }
         }
         section("Logging") {
@@ -278,6 +306,9 @@ void initialize() {
         runIn(10, "forecastRefresh")
     } else {
         runtimeMap("forecast").clear()
+        runtimeMap("forecastParts").clear()
+        runtimeMap("forecastFails").clear()
+        state.remove("forecastDays")
         siteDevices().findAll { it.getDataValue("type") == "inverter" && it.currentValue("forecastToday") != null }.each { cd -> cd.clearForecast() }
     }
     if (siteDevices()) {
@@ -1119,59 +1150,203 @@ private def defaultKwp() {
     (state.sites ?: [:]).values().find { it.peakPower instanceof Number }?.peakPower
 }
 
-/** Ask Forecast.Solar for each site with an inverter; once an hour (runEvery1Hour) and at setup. */
+/** How many roof faces have panels (forecastFaces, 1 to 3). */
+int faceCount() {
+    def n = settings.forecastFaces
+    return Math.max(1, Math.min(3, n ? (n as String).toInteger() : 1))
+}
+
+/** A face's setting name: face 1 keeps the names from before faces existed (forecastTilt), the others get a number (forecastTilt2). */
+String faceSetting(String name, int face) { face == 1 ? name : "${name}${face}".toString() }
+
+/** Each face's tilt, compass bearing and share of the system size; shared by panel count, evenly while one is missing. */
+List forecastFaces() {
+    int n = faceCount()
+    List panels = (1..n).collect { settings."forecastPanels${it}" }
+    boolean counted = n > 1 && panels.every { it instanceof Number && it > 0 }
+    double total = counted ? panels.sum() as double : n
+    return (1..n).collect { int i ->
+        def tilt = settings[faceSetting("forecastTilt", i)]
+        def bearing = settings[faceSetting("forecastBearing", i)]
+        [tilt: (tilt != null ? tilt : DEFAULT_TILT) as int, bearing: (bearing != null ? bearing : DEFAULT_BEARING) as int,
+            share: (counted ? panels[i - 1] as double : 1d) / total]
+    }
+}
+
+/** The system size (kWp) for a site: the setting, else SolarEdge's peak power; null while neither is known. */
+def forecastKwp(String siteId) {
+    def kwp = settings.forecastKwp ?: ((state.sites ?: [:])[siteId] ?: [:]).peakPower
+    return kwp instanceof Number && kwp > 0 ? kwp : null
+}
+
+/** What was learned per site, for the settings page; null while nothing was. */
+String learnedSummary() {
+    List lines = []
+    (state.forecastLearned ?: [:]).each { siteId, bySource ->
+        bySource.each { source, l ->
+            if (l.setup == forecastSetup(siteId as String)) {
+                lines << "${FORECAST_SOURCES[source]} forecasts for site ${siteId} x${l.factor}, learned from ${l.days} day${l.days == 1 ? '' : 's'}."
+            }
+        }
+    }
+    return lines ? lines.join(" ") : null
+}
+
+/** The chosen forecast source (forecastSource), Open-Meteo unless Forecast.Solar is chosen. */
+String forecastSource() { settings.forecastSource == "forecastsolar" ? "forecastsolar" : "openmeteo" }
+
+/** The other source, used while the chosen one fails. */
+String otherSource(String source) { source == "openmeteo" ? "forecastsolar" : "openmeteo" }
+
+/** Ask the forecast source for each site with an inverter, once per roof face; once an hour (runEvery1Hour) and at setup. */
 void forecastRefresh() {
     if (!settings.forecastEnable) return
     runtime().forecastAskedAt = now()
-    def lat = location?.latitude
-    def lon = location?.longitude
-    if (lat == null || lon == null) {
+    if (location?.latitude == null || location?.longitude == null) {
         logOnce("forecast no location", "solar forecast needs the hub's location (Settings > Location)")
         return
     }
     List siteIds = siteDevices().findAll { it.getDataValue("type") == "inverter" }*.getDataValue("siteId").unique()
     siteIds.each { String siteId ->
-        Map site = (state.sites ?: [:])[siteId] ?: [:]
-        def kwp = settings.forecastKwp ?: site.peakPower
-        if (!(kwp instanceof Number) || kwp <= 0) {
+        if (forecastKwp(siteId) == null) {
             logOnce("forecast no kwp ${siteId}", "solar forecast for site ${siteId} needs the system size (kWp) in the app settings")
             return
         }
-        String path = forecastPath(lat as double, lon as double, (settings.forecastTilt != null ? settings.forecastTilt : DEFAULT_TILT) as int,
-            (settings.forecastBearing != null ? settings.forecastBearing : DEFAULT_BEARING) as int, kwp as double)
-        logDebug "Forecast for site ${siteId}: GET ${FORECAST_URL}${path}"
-        asynchttpGet("forecastDone", [uri: FORECAST_URL, path: path, query: [time: "iso8601"], headers: [Accept: "application/json"],
-            contentType: "application/json", timeout: REQUEST_TIMEOUT], [siteId: siteId])
+        // The chosen source is asked every hour, also while the other one stands in for it.
+        forecastRound(siteId, forecastSource())
     }
 }
 
-/** /estimate/lat/lon/tilt/azimuth/kWp, the location rounded to about 1 km, the azimuth counted from south. */
-String forecastPath(double lat, double lon, int tilt, int bearing, double kwp) {
-    int az = ((((bearing - 180) % 360) + 540) % 360) - 180
-    Closure r = { double v -> new BigDecimal(v).setScale(FORECAST_DECIMALS, BigDecimal.ROUND_HALF_UP).toPlainString() }
-    return "/estimate/${r(lat)}/${r(lon)}/${Math.max(0, Math.min(90, tilt))}/${az}/${new BigDecimal(kwp).setScale(2, BigDecimal.ROUND_HALF_UP).stripTrailingZeros().toPlainString()}".toString()
+/** One request per roof face to `source`; the faces' answers are collected per round and added up once all are in. */
+private void forecastRound(String siteId, String source) {
+    double lat = location.latitude as double
+    double lon = location.longitude as double
+    double kwp = forecastKwp(siteId) as double
+    String tz = ((state.sites ?: [:])[siteId]?.tz) ?: location?.timeZone?.ID
+    List faces = forecastFaces()
+    long round = now()
+    runtimeMap("forecastParts")[siteId] = new ConcurrentHashMap([round: round, source: source])
+    // Failures of faces no longer asked (the number of faces changed) would never be logged as working again.
+    String base = "forecast:${source}:${siteId}".toString()
+    List keys = faces.size() > 1 ? (1..faces.size()).collect { "${base}:${it}".toString() } : [base]
+    runtimeMap("failing").keySet().findAll { (it == base || it.startsWith(base + ":")) && !(it in keys) }.each { runtimeMap("failing").remove(it) }
+    faces.eachWithIndex { Map f, int i ->
+        double faceKwp = kwp * (f.share as double)
+        Map req = source == "openmeteo" ? [uri: OPEN_METEO_URL, path: "/v1/forecast", query: openMeteoQuery(lat, lon, f.tilt as int, f.bearing as int, tz)] :
+            [uri: FORECAST_URL, path: forecastPath(lat, lon, f.tilt as int, f.bearing as int, faceKwp), query: [time: "iso8601"]]
+        logDebug "Forecast for site ${siteId}${faces.size() > 1 ? ', face ' + (i + 1) : ''}: GET ${req.uri}${req.path} ${req.query}"
+        asynchttpGet("forecastDone", req + [headers: [Accept: "application/json"], contentType: "application/json", timeout: REQUEST_TIMEOUT],
+            [siteId: siteId, face: i + 1, faces: faces.size(), round: round, source: source, kwp: faceKwp, tz: tz])
+    }
 }
+
+/** Forecast.Solar's /estimate/lat/lon/tilt/azimuth/kWp, the location rounded to about 1 km, the azimuth counted from south. */
+String forecastPath(double lat, double lon, int tilt, int bearing, double kwp) {
+    return "/estimate/${roundedDeg(lat)}/${roundedDeg(lon)}/${Math.max(0, Math.min(90, tilt))}/${azimuth(bearing)}/${new BigDecimal(kwp).setScale(2, BigDecimal.ROUND_HALF_UP).stripTrailingZeros().toPlainString()}".toString()
+}
+
+/** Open-Meteo's sunlight on the panels (W/m², every 15 minutes) for today and tomorrow, the location rounded the same way. */
+Map openMeteoQuery(double lat, double lon, int tilt, int bearing, String tz) {
+    return [latitude: roundedDeg(lat), longitude: roundedDeg(lon), minutely_15: "global_tilted_irradiance_instant",
+        tilt: Math.max(0, Math.min(90, tilt)) as String, azimuth: azimuth(bearing) as String, timezone: tz ?: "auto",
+        timeformat: "unixtime", forecast_days: "2"]
+}
+
+/** A compass bearing as both services count it: from south, -90 east, 90 west. */
+private int azimuth(int bearing) { ((((bearing - 180) % 360) + 540) % 360) - 180 }
+
+/** A latitude or longitude rounded to about 1 km. */
+private String roundedDeg(double v) { new BigDecimal(v).setScale(FORECAST_DECIMALS, BigDecimal.ROUND_HALF_UP).toPlainString() }
 
 def forecastDone(resp, Map data) {
     String siteId = data.siteId as String
+    int face = (data.face ?: 1) as int
+    int faces = (data.faces ?: 1) as int
+    String source = (data.source ?: "forecastsolar") as String
     int status = statusOf(resp)
     def json = parseJsonText(bodyOf(resp))
-    String key = "forecast:${siteId}".toString()
-    String what = "solar forecast for site ${siteId}"
-    if (status != 200 || !(json instanceof Map) || !(json.result instanceof Map)) {
-        noteFailure(key, what, (json instanceof Map ? json.message?.text : null) ?: errorMessage(resp) ?: "HTTP ${status}")
+    String key = "forecast:${source}:${siteId}${faces > 1 ? ':' + face : ''}".toString()
+    String what = "${FORECAST_SOURCES[source]} forecast for site ${siteId}${faces > 1 ? ', roof face ' + face : ''}"
+    Map parts = runtimeMap("forecastParts")[siteId]
+    // A newer round started meanwhile: its own answers count.
+    boolean current = data.round == null || parts?.round == data.round
+    Map part = null
+    if (status == 200 && json instanceof Map) {
+        String tz = (data.tz ?: location?.timeZone?.ID) as String
+        if (source == "openmeteo" && json.minutely_15 instanceof Map) part = parseOpenMeteo(json.minutely_15, data.kwp as double, tz)
+        if (source == "forecastsolar" && json.result instanceof Map) part = parseForecast(json.result, json.message?.info?.timezone ?: tz)
+    }
+    if (part == null || !part.days) {
+        String error = part != null ? "no whole day in the answer" :
+            (json instanceof Map ? (json.reason ?: json.message?.text) : null) ?: errorMessage(resp) ?: "HTTP ${status}"
+        noteFailure(key, what, error as String)
+        if (current && parts != null && source == forecastSource() && !parts.failed) forecastFailed(siteId, source)
         return
     }
     noteFailure(key, what, null)
-    String tz = json.message?.info?.timezone ?: ((state.sites ?: [:])[siteId]?.tz) ?: location?.timeZone?.ID
+    if (!current) return
+    if (parts != null) parts[face] = part
+    // Until every face has answered, the last whole forecast stays.
+    if (faces > 1 && (parts == null || (1..faces).any { !parts[it] })) return
+    if (source == forecastSource()) {
+        Map f = runtimeMap("forecastFails").remove(siteId)
+        if (f?.source == source && f.standIn) log.info "SolarEdge: ${FORECAST_SOURCES[source]} forecast for site ${siteId} is used again"
+    }
     // In memory, not state: this runs in its own execution, which would write back the
     // state it loaded and undo a poll's battery totals saved meanwhile (or lose this).
-    runtimeMap("forecast")[siteId] = parseForecast(json.result, tz) + [fetchedAt: now()]
-    logDebug "Forecast for site ${siteId}: ${runtimeMap('forecast')[siteId].days}"
+    runtimeMap("forecast")[siteId] = (faces > 1 ? addForecasts((1..faces).collect { parts[it] }) : part) + [source: source, fetchedAt: now()]
+    logDebug "Forecast for site ${siteId} from ${FORECAST_SOURCES[source]}: ${runtimeMap('forecast')[siteId].days.collect { d, wh -> "${d} ${round((wh as double) / 1000, 1)} kWh" }.join(', ')}"
     // Shown right away, not only on the next poll.
     siteDevices().findAll { it.getDataValue("type") == "inverter" && it.getDataValue("siteId") == siteId }.each { cd ->
         cd.applyEvents(forecastEvents(siteId, now(), cd.currentValue("energyToday")))
     }
+}
+
+/**
+ * The chosen source failed a round. Once it has failed for FALLBACK_AFTER_MS,
+ * or right away while there's no forecast at all, the other source stands in:
+ * from then on every failed round of the chosen one asks the other, until the
+ * chosen one answers again. A failure kept for another source (the setting
+ * changed since) starts over.
+ */
+private void forecastFailed(String siteId, String source) {
+    runtimeMap("forecastParts")[siteId].failed = true
+    Map fails = runtimeMap("forecastFails")
+    Map f = fails[siteId]
+    if (f?.source != source) {
+        f = new ConcurrentHashMap([source: source, since: now(), standIn: false])
+        fails[siteId] = f
+    }
+    if (!f.standIn) {
+        if (now() - (f.since as long) < FALLBACK_AFTER_MS && runtimeMap("forecast")[siteId]) return
+        f.standIn = true
+        log.info "SolarEdge: using ${FORECAST_SOURCES[otherSource(source)]} for site ${siteId}'s forecast while ${FORECAST_SOURCES[source]} fails"
+    }
+    forecastRound(siteId, otherSource(source))
+}
+
+/**
+ * An Open-Meteo `minutely_15` answer as a forecast: the sunlight on the panels
+ * (W/m², at unix seconds) times the face's kWp and OPEN_METEO_RATIO is the
+ * power curve, and each whole day's curve integrated is its Wh.
+ */
+Map parseOpenMeteo(Map m, double kwp, String tz) {
+    List times = m.time instanceof List ? m.time : []
+    List gti = m.global_tilted_irradiance_instant instanceof List ? m.global_tilted_irradiance_instant : []
+    Map watts = [:]
+    times.eachWithIndex { def at, int i ->
+        def v = i < gti.size() ? gti[i] : null
+        if (!(at instanceof Number) || !(v instanceof Number)) return
+        long ms = (at as long) * 1000L
+        String day = dayIn(ms, tz)
+        if (!watts[day]) watts[day] = []
+        watts[day] << [ms, Math.max(0d, v as double) * kwp * OPEN_METEO_RATIO]
+    }
+    watts.each { day, pts -> pts.sort { it[0] } }
+    Map days = [:]
+    // A day counts once the answer covers it to the last quarter hour (the last day can stop short).
+    watts.each { day, pts -> if (pts.size() >= 90) days[day] = integrate(pts, Long.MAX_VALUE) }
+    return [tz: tz, days: days, watts: watts]
 }
 
 /**
@@ -1204,6 +1379,23 @@ Map parseForecast(Map result, String tz) {
     return [tz: tz, days: days, watts: watts]
 }
 
+/**
+ * Roof faces' forecasts (parseForecast) added up: Wh per day for the days all
+ * know, and the power curves summed at every moment any of them has (each
+ * curve is straight between its points, so that sum is exact).
+ */
+Map addForecasts(List fcs) {
+    Map days = [:]
+    fcs[0].days.keySet().each { day -> if (fcs.every { it.days[day] != null }) days[day] = fcs.sum { it.days[day] as double } }
+    Map watts = [:]
+    fcs.collectMany { it.watts.keySet() as List }.unique().each { day ->
+        List curves = fcs.collect { it.watts[day] ?: [] }
+        List times = curves.collectMany { c -> c.collect { it[0] as long } }.unique().sort()
+        watts[day] = times.collect { long t -> [t, curves.sum { c -> interpolate(c, t, 0d, 0d) } as double] }
+    }
+    return [tz: fcs[0].tz, days: days, watts: watts]
+}
+
 /** The day after a "yyyy-MM-dd" date, by the calendar (not +24 h, which DST days break). */
 String nextDay(String day) {
     java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyy-MM-dd")
@@ -1215,28 +1407,97 @@ String nextDay(String day) {
  * The inverter's forecast events at `t`: today's and tomorrow's forecast (kWh),
  * the forecast power now (W), the forecast energy so far today (kWh: the power
  * curve integrated up to now, scaled to the day's total), and the actual energy
- * today as % of that (once the forecast so far is 0.1 kWh or more).
+ * today as % of that (once the forecast so far is 0.1 kWh or more). All of it
+ * corrected by what was learned from this site's production (forecastFactor).
  */
-List forecastEvents(String siteId, long t, def actualToday) {
+List forecastEvents(String siteId, long t, def actualToday, String setup = null) {
     if (!settings.forecastEnable) return []
     Map fc = runtimeMap("forecast")[siteId]
     if (!fc) return []
+    double k = forecastFactor(siteId, fc.source as String, setup)
     String day = dayIn(t, fc.tz)
     String next = nextDay(day)
     List out = []
-    if (fc.days[day] != null) out << ev("forecastToday", round((fc.days[day] as double) / 1000, 2), "kWh")
-    if (fc.days[next] != null) out << ev("forecastTomorrow", round((fc.days[next] as double) / 1000, 2), "kWh")
+    if (fc.days[day] != null) out << ev("forecastToday", round((fc.days[day] as double) * k / 1000, 2), "kWh")
+    if (fc.days[next] != null) out << ev("forecastTomorrow", round((fc.days[next] as double) * k / 1000, 2), "kWh")
     // Only forecasts for today count for now and so far (an old one says nothing about today).
     if (fc.days[day] == null) return out
     List pts = fc.watts[day] ?: []
-    out << ev("forecastPower", (Math.round(interpolate(pts, t, 0d, 0d) / 10) * 10) as int, "W")
+    out << ev("forecastPower", (Math.round(interpolate(pts, t, 0d, 0d) * k / 10) * 10) as int, "W")
     double whole = integrate(pts, Long.MAX_VALUE)
-    double soFar = whole > 0 ? integrate(pts, t) / whole * (fc.days[day] as double) : 0d
+    double soFar = whole > 0 ? integrate(pts, t) / whole * (fc.days[day] as double) * k : 0d
     out << ev("forecastSoFar", round(soFar / 1000, 2), "kWh")
     if (actualToday instanceof Number && soFar >= 100) {
         out << ev("actualVsForecast", Math.round((actualToday as double) * 1000 / soFar * 100) as int, "%")
     }
     return out
+}
+
+// ---------------------------------------------------------------- forecast learning
+
+/**
+ * What the roof settings are, for the learning: a factor learned with other
+ * settings (size, faces, tilt, direction) doesn't hold for new ones.
+ */
+String forecastSetup(String siteId) { "${forecastKwp(siteId)}:${forecastFaces()}".toString() }
+
+/** The learned correction for a site's forecasts from `source`; 1 until a day was learned (or after the settings changed). */
+double forecastFactor(String siteId, String source, String setup = null) {
+    Map l = ((state.forecastLearned ?: [:])[siteId] ?: [:])[source]
+    return l && l.setup == (setup ?: forecastSetup(siteId)) && l.factor instanceof Number ? l.factor as double : 1d
+}
+
+/**
+ * On each energy tick (whose execution owns state): keep today's forecast and
+ * actual production for the site, and when the day changes learn from the day
+ * before. A day counts when the forecast was 1 kWh per kWp or more and the
+ * ticks ran past the forecast's sunset. Its actual / forecast moves the
+ * factor: averaged with the starting x1 counted as two days (so one odd day
+ * moves it a third of the way), then each new day weighs 10 %, so the last
+ * few weeks count most. Kept between 0.5 and 1.5.
+ */
+void forecastLearn(String siteId, long t, def actualToday, String setup = null) {
+    if (!settings.forecastEnable) return
+    if (setup == null) setup = forecastSetup(siteId)
+    Map fc = runtimeMap("forecast")[siteId]
+    Map days = state.forecastDays ?: [:]
+    Map rec = days[siteId]
+    String tz = fc?.tz ?: rec?.tz
+    if (!tz) return
+    String day = dayIn(t, tz)
+    if (rec && rec.day != day) {
+        learnDay(siteId, rec, setup)
+        rec = null
+    }
+    if (fc && fc.days[day] != null && actualToday instanceof Number) {
+        def lastSun = (fc.watts[day] ?: []).findAll { (it[1] as double) > 0 }.collect { it[0] as long }.max()
+        days[siteId] = [day: day, tz: fc.tz, source: fc.source, forecast: fc.days[day], actual: actualToday, at: t,
+            sunset: lastSun, setup: setup]
+    } else if (rec == null) {
+        days.remove(siteId)
+    }
+    state.forecastDays = days
+}
+
+private void learnDay(String siteId, Map rec, String setup) {
+    def kwp = forecastKwp(siteId)
+    if (kwp == null || rec.setup != setup || !(rec.forecast instanceof Number) || !(rec.actual instanceof Number)) return
+    if ((rec.forecast as double) < (kwp as double) * 1000 || rec.sunset == null || (rec.at as long) < (rec.sunset as long)) return
+    double ratio = (rec.actual as double) * 1000 / (rec.forecast as double)
+    // A day this far off is an outage or a wrong reading, not something to learn.
+    if (ratio < 0.2 || ratio > 3) return
+    Map all = state.forecastLearned ?: [:]
+    Map site = all[siteId] ?: [:]
+    Map l = site[rec.source]
+    if (!l || l.setup != rec.setup) l = [factor: 1d, days: 0, setup: rec.setup]
+    int n = (l.days as int) + 1
+    double w = Math.max(0.1d, 1d / (n + 2))
+    double factor = Math.max(0.5d, Math.min(1.5d, (l.factor as double) * (1 - w) + ratio * w))
+    site[rec.source] = [factor: Math.round(factor * 1000) / 1000d, days: n, setup: rec.setup]
+    all[siteId] = site
+    state.forecastLearned = all
+    log.info "SolarEdge: site ${siteId} made ${round(rec.actual as double, 1)} kWh on ${rec.day}, ${FORECAST_SOURCES[rec.source]} forecast " +
+        "${round((rec.forecast as double) / 1000, 1)} kWh: forecasts now x${site[rec.source].factor} (learned from ${n} day${n == 1 ? '' : 's'})"
 }
 
 /** Wh under a power curve ([ms, W] points) up to `t`: trapezoids, the last one cut at t. */
@@ -1255,11 +1516,11 @@ private double integrate(List pts, long t) {
     return wh
 }
 
-/** Linear between [ms, value] points; `before` / `after` outside them. */
+/** Linear between [ms, value] points, their own values on them; `before` / `after` outside them. */
 private double interpolate(List pts, long t, double before, double after) {
     if (!pts) return before
-    if (t <= (pts[0][0] as long)) return before
-    if (t >= (pts[-1][0] as long)) return after
+    if (t < (pts[0][0] as long)) return before
+    if (t > (pts[-1][0] as long)) return after
     for (int i = 1; i < pts.size(); i++) {
         long t1 = pts[i][0] as long
         if (t <= t1) {
@@ -1347,7 +1608,9 @@ List eventsFor(def cd, String type, String siteId, Map by, long t) {
             // On energy ticks only, together with the energyToday they compare against.
             Map todayEv = inv.find { it.name == "energyToday" }
             if (!todayEv) return inv
-            return inv + forecastEvents(siteId, t, todayEv.value)
+            String setup = forecastSetup(siteId)
+            forecastLearn(siteId, t, todayEv.value, setup)
+            return inv + forecastEvents(siteId, t, todayEv.value, setup)
         case "meter":
             int y = yearIn(t, site.tz)
             return meterEvents(j("powerflow:${siteId}"), [communication: j("communication:${siteId}"), totals: meterTotals(siteId, y), asleep: asleep])

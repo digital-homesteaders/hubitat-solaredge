@@ -164,27 +164,64 @@ device also has a **`summary`** attribute: one line with units, for example
 
 #### Solar forecast
 
-Turn on **Solar forecast from Forecast.Solar** in the app to compare actual
-production with what was expected, like Homey's Energy view does.
-[Forecast.Solar](https://forecast.solar) is a free public service and needs
-no account.
-- **What it gets:** once an hour, the hub's location (from Settings >
-  Location, rounded to about 1 km), the panel tilt, the direction they face
-  and the system size.
+Turn on **Solar forecast** in the app to compare actual production with what
+was expected, like Homey's Energy view does. Two free services, neither
+needing an account:
+- **[Open-Meteo](https://open-meteo.com)** (the default): the sunlight
+  forecast on the panels' tilt and direction, every 15 minutes, from the
+  weather model that fits the location (NOAA's in the US, DWD's and
+  ECMWF's in Europe). The app makes that into power: sunlight × kWp × 0.85
+  for losses.
+- **[Forecast.Solar](https://forecast.solar)**: a solar power forecast,
+  chosen under **Forecast from**. Before Open-Meteo was added this was the
+  only source; existing installs move to Open-Meteo unless Forecast.Solar
+  is chosen there.
+
+How it works:
+- **What goes out:** once an hour, the hub's location (from Settings >
+  Location, rounded to about 1 km), the panel tilt and the direction they
+  face; Forecast.Solar also gets the system size.
 - **What comes back:** the expected power through today and tomorrow. The app
   keeps it in memory (after a hub restart it asks again) and updates the
   forecast values on every 5-minute energy tick, together with
   `energyToday`, so actual vs forecast compares the same moment.
-- **Turning it off** removes the forecast values from the inverter.
-- **Settings:** the system size defaults to the peak power SolarEdge reports
-  (on an existing install, open **Choose devices** once so the app reads it,
-  or enter it). Tilt defaults to 30° and direction to 180° (south); set
-  them to your roof.
-- **Several sites:** all use the hub's location and the same tilt and
-  direction.
-- **Limits:** the free service allows 12 requests an hour; the app uses 1 per
-  site. Its forecast is a model from weather data, so expect it to be off by
-  a fair amount on changeable days.
+- **When a service fails:** the last forecast stays. Once it has failed for
+  2 hours (its third hourly try), or right away when there's no forecast
+  yet, the other service stands in. The chosen one is still asked every
+  hour and takes over again once it answers. Each switch is logged.
+- **Learning from your production:** after each day the app compares what
+  the site made (`energyToday` at the end of the day) with that day's
+  forecast, and corrects later forecasts by it, so shade, dirt, losses and
+  settings that are a little off count. Only fairly sunny days count (a
+  forecast of 1 kWh per kWp or more), and only when the hub ran past sunset.
+  Way-off days (under 20 % or over 300 %, an outage, say) are skipped. The
+  first days are averaged with the starting ×1 counted as two days, so one
+  odd day moves it only a third of the way; after that each day weighs
+  10 %, so the last few weeks count most. The correction stays between ×0.5 and ×1.5, is kept per
+  service, and starts over when the size, faces, tilt or direction change.
+  The app's page shows it under **Learning**, and the log says what each day
+  taught it.
+- **Turning it off** removes the forecast values from the inverter. What was
+  learned is kept.
+- **System size (kWp):** all panels together, in kW: the number of panels
+  times the watts of one panel (on its label and in the installer's
+  quote), divided by 1000. 20 panels of 400 W are 8 kW. Left empty, the app
+  uses the peak power SolarEdge reports (on an existing install, open
+  **Choose devices** once so the app reads it).
+- **Tilt and direction:** tilt defaults to 30° and direction to 180°
+  (south); set them to your roof. The SolarEdge data the app reads doesn't
+  include them.
+- **Panels on more than one roof face** (east and west, or north and
+  south): set **Roof faces with panels** to 2 or 3 and give each face its
+  tilt, direction and number of panels. The system size is shared between
+  the faces by panel count (evenly while a count is missing). Each face is
+  its own request and the forecasts are added up; until every face has
+  answered, the last whole forecast stays.
+- **Several sites:** all use the hub's location and the same faces.
+- **Limits:** one request per roof face per site an hour, well within both
+  free tiers (Forecast.Solar allows 12 an hour, Open-Meteo 10,000 a day for
+  non-commercial use). Forecasts come from weather models: close on clear
+  days, often well off on changeable ones.
 
 ### SolarEdge Meter
 
@@ -364,9 +401,13 @@ itself still needs checking.
    discharge of about 0.55 kWh around 22:15–22:41 never showed up in the
    power flow or the devices list. The stale-data warnings and the raw-data
    button above are there to find out why.
-8. The solar forecast against the real Forecast.Solar API: the tests use a
-   made-up answer in the documented shape (`tests/fixtures/forecast-solar.json`),
-   including the `time=iso8601` option. The app also reads plain local times.
+8. The solar forecast against the real services: the tests use made-up
+   answers in the documented shapes (`tests/fixtures/forecast-solar.json`,
+   with the `time=iso8601` option, and `tests/fixtures/open-meteo.json`).
+   The app also reads Forecast.Solar's plain local times. On 2026-10-21
+   Forecast.Solar answered "No PVGIS database available" for every new
+   location tried, in the US and in Europe; Open-Meteo answered for the
+   same US location.
 9. EV charger and load controller commands. These were never tested live in
    2.0.0 either.
 
@@ -379,6 +420,6 @@ A port of [com.solaredge](https://github.com/gruijter/com.solaredge) v2.0.0
 for Homey by **Robin de Gruijter**, itself based on the original app by Emile
 Nijssen (Athom). The SolarEdge cloud client, the energy-tick timing, the
 device mappings and the test fixtures come from that project (GPL-3.0).
-Solar forecasts by [Forecast.Solar](https://forecast.solar) (free public
-API). Hubitat port and changes © 2026 Digital Homesteaders. Not affiliated with or endorsed
+Solar forecasts by [Open-Meteo](https://open-meteo.com) (weather data
+CC BY 4.0) and [Forecast.Solar](https://forecast.solar) (free public APIs). Hubitat port and changes © 2026 Digital Homesteaders. Not affiliated with or endorsed
 by SolarEdge.
