@@ -413,6 +413,124 @@ check("forecast: an actual of 0 counts as 0 %") {
     assert forecastAt(captured, 0).actualVsForecast == 0
 }
 
+check("forecast for two roof faces: days and power curves added up") {
+    Map east = app.parseForecast([watts: ["2026-10-15T07:00:00+02:00": 0, "2026-10-15T10:00:00+02:00": 3000, "2026-10-15T16:00:00+02:00": 0],
+        watt_hours_day: ["2026-10-15": 12000, "2026-10-16": 11000]], "Europe/Amsterdam")
+    Map west = app.parseForecast([watts: ["2026-10-15T08:00:00+02:00": 0, "2026-10-15T15:00:00+02:00": 2000, "2026-10-15T18:00:00+02:00": 500],
+        watt_hours_day: ["2026-10-15": 9000]], "Europe/Amsterdam")
+    Map both = app.addForecasts([east, west])
+    assert both.days == ["2026-10-15": 21000d], "only days both faces know"
+    Map w = both.watts["2026-10-15"].collectEntries { [(new Date(it[0] as long).format("HH:mm", TimeZone.getTimeZone("Europe/Amsterdam"))): it[1]] }
+    assert w == ["07:00": 0d, "08:00": 1000d, "10:00": 3000d + 2000d * 2 / 7, "15:00": 500d + 2000d, "16:00": 0d + 2000d - 1500d / 3, "18:00": 500d]
+}
+
+check("forecast faces: size shared by panel count, evenly while one is missing; face 1 keeps the old settings") {
+    app.settings.forecastFaces = "2"
+    app.settings.forecastBearing = 90
+    app.settings.forecastBearing2 = 270
+    app.settings.forecastTilt2 = 15
+    assert app.forecastFaces() == [[tilt: 30, bearing: 90, share: 0.5d], [tilt: 15, bearing: 270, share: 0.5d]]
+    app.settings.forecastPanels1 = 6
+    assert app.forecastFaces()*.share == [0.5d, 0.5d], "one count missing"
+    app.settings.forecastPanels2 = 10
+    assert app.forecastFaces()*.share == [6d / 16, 10d / 16]
+    app.settings.forecastFaces = "1"
+    assert app.forecastFaces() == [[tilt: 30, bearing: 90, share: 1d]], "panel counts ignored with one face"
+    ["forecastFaces", "forecastBearing", "forecastBearing2", "forecastTilt2", "forecastPanels1", "forecastPanels2"].each { app.settings.remove(it) }
+}
+
+@Field Map openMeteoAnswer = new JsonSlurper().parse(new File(root, "tests/fixtures/open-meteo.json"))
+
+check("Open-Meteo query: location rounded like Forecast.Solar's, azimuth from south, unix times") {
+    assert app.openMeteoQuery(52.3731339d, 4.8903147d, 35, 90, "Europe/Amsterdam") == [latitude: "52.37", longitude: "4.89",
+        minutely_15: "global_tilted_irradiance_instant", tilt: "35", azimuth: "-90", timezone: "Europe/Amsterdam", timeformat: "unixtime", forecast_days: "2"]
+    assert app.openMeteoQuery(40.31d, -111.71d, 95, 270, null).subMap(["tilt", "azimuth", "timezone"]) == [tilt: "90", azimuth: "90", timezone: "auto"]
+}
+
+check("Open-Meteo: sunlight on the panels times kWp and the loss ratio is the power, whole days are integrated") {
+    Map fc = app.parseOpenMeteo(openMeteoAnswer.minutely_15, 8d, "Europe/Amsterdam")
+    assert fc.days.keySet() == ["2026-10-15", "2026-10-16"] as Set
+    assert Math.round(fc.days["2026-10-15"] / 10) == 3024
+    // W/m² on 8 kWp at 0.85
+    int noon = openMeteoAnswer.minutely_15.time.indexOf((iso("2026-10-15T12:00:00+02:00") / 1000) as int)
+    assert fc.watts["2026-10-15"].find { it[0] == iso("2026-10-15T12:00:00+02:00") }[1] == openMeteoAnswer.minutely_15.global_tilted_irradiance_instant[noon] * 8 * 0.85d
+    // A day the answer stops short of isn't a day's total; nulls and negatives don't count.
+    Map cut = app.parseOpenMeteo([time: openMeteoAnswer.minutely_15.time.take(140), global_tilted_irradiance_instant:
+        openMeteoAnswer.minutely_15.global_tilted_irradiance_instant.take(139) + [null]], 8d, "Europe/Amsterdam")
+    assert cut.days.keySet() == ["2026-10-15"] as Set && cut.watts["2026-10-16"].size() == 43
+    assert app.parseOpenMeteo([time: [1792062000], global_tilted_irradiance_instant: [-3]], 8d, "UTC").watts["2026-10-15"] == [[1792062000000L, 0d]]
+}
+
+check("forecast learning: a sunny day's actual / forecast moves the factor, which corrects what's shown") {
+    app.settings.forecastEnable = true
+    app.settings.forecastKwp = 8
+    app.state.remove("forecastLearned"); app.state.remove("forecastDays")
+    Map fc = app.parseOpenMeteo(openMeteoAnswer.minutely_15, 8d, "Europe/Amsterdam") + [source: "openmeteo"]
+    app.runtimeMap("forecast")["1"] = fc
+    double today = fc.days["2026-10-15"] / 1000
+    // Through the day; the last tick after the forecast's sunset (18:45), at 90 % of the forecast.
+    app.forecastLearn("1", iso("2026-10-15T12:00:00+02:00"), 10.0)
+    app.forecastLearn("1", iso("2026-10-15T19:00:00+02:00"), today * 0.9)
+    assert app.forecastFactor("1", "openmeteo") == 1d, "nothing learned before the day is over"
+    app.forecastLearn("1", iso("2026-10-16T00:05:00+02:00"), 0.0)
+    assert app.forecastFactor("1", "openmeteo") == 0.967d, "the starting x1 counts as two days: a third of the way to 0.9"
+    assert app.state.forecastLearned["1"].openmeteo.days == 1
+    assert app.forecastFactor("1", "forecastsolar") == 1d, "per source"
+    assert app.learnedSummary() == "Open-Meteo forecasts for site 1 x0.967, learned from 1 day."
+    // Shown corrected: tomorrow's 16 Oct is now today.
+    Map v = evs(app.forecastEvents("1", iso("2026-10-16T00:05:00+02:00"), 0.0))
+    assert v.forecastToday == app.round(fc.days["2026-10-16"] * 0.967 / 1000, 2)
+    // The second day weighs a quarter: back to 1.0 after 0.9 and 1.1.
+    app.forecastLearn("1", iso("2026-10-16T19:00:00+02:00"), fc.days["2026-10-16"] / 1000 * 1.1)
+    app.forecastLearn("1", iso("2026-10-17T07:00:00+02:00"), 0.0)
+    assert app.forecastFactor("1", "openmeteo") == 1d && app.state.forecastLearned["1"].openmeteo.days == 2
+    // Other settings: what was learned doesn't hold.
+    app.settings.forecastTilt = 40
+    assert app.forecastFactor("1", "openmeteo") == 1d && app.learnedSummary() == null
+    app.settings.remove("forecastTilt")
+    assert app.forecastFactor("1", "openmeteo") == 1d && app.learnedSummary() != null
+    app.settings.remove("forecastEnable"); app.settings.remove("forecastKwp")
+    app.state.remove("forecastLearned"); app.state.remove("forecastDays")
+}
+
+check("forecast learning skips dark days, days the ticks stopped early, outages, and keeps the factor in 0.5..1.5") {
+    app.settings.forecastEnable = true
+    app.settings.forecastKwp = 8
+    Closure day = { Map fc, String date, String lastTick, double actual ->
+        app.state.remove("forecastDays")
+        app.runtimeMap("forecast")["1"] = fc
+        app.forecastLearn("1", iso("${date}T${lastTick}:00+02:00"), actual)
+        app.forecastLearn("1", iso("${date}T23:59:00+02:00") + 120000L, 0.0)
+    }
+    Map sunny = app.parseOpenMeteo(openMeteoAnswer.minutely_15, 8d, "Europe/Amsterdam") + [source: "openmeteo"]
+    Map dark = app.parseOpenMeteo(openMeteoAnswer.minutely_15, 0.2d, "Europe/Amsterdam") + [source: "openmeteo"]
+    app.state.remove("forecastLearned")
+    day(dark, "2026-10-15", "19:00", 0.5)
+    assert !app.state.forecastLearned, "under 1 kWh per kWp"
+    day(sunny, "2026-10-15", "16:00", 20.0)
+    assert !app.state.forecastLearned, "last tick before sunset"
+    day(sunny, "2026-10-15", "19:00", 1.0)
+    assert !app.state.forecastLearned, "a day this far off is an outage"
+    day(sunny, "2026-10-15", "19:00", 87.0)
+    assert app.forecastFactor("1", "openmeteo") == 1.5d, "kept at 1.5"
+    app.settings.remove("forecastEnable"); app.settings.remove("forecastKwp")
+    app.state.remove("forecastLearned"); app.state.remove("forecastDays")
+    app.runtimeMap("forecast").clear()
+}
+
+check("forecast curves: the first and last points are the curve's own values, outside them before/after") {
+    List pts = [[1000L, 5d], [2000L, 15d], [3000L, 7d]]
+    assert app.interpolate(pts, 1000L, -1d, -2d) == 5d && app.interpolate(pts, 3000L, -1d, -2d) == 7d
+    assert app.interpolate(pts, 999L, -1d, -2d) == -1d && app.interpolate(pts, 3001L, -1d, -2d) == -2d
+    assert app.interpolate(pts, 1500L, -1d, -2d) == 10d
+}
+
+check("meter: grid power within 100 W either way is idle (a battery keeps it near 0 W)") {
+    Closure status = { def w, String dir -> evs(app.meterEvents([grid: [currentPower: w, status: dir, isActive: true]])).gridStatus }
+    assert status(0.04, "Import") == "idle" && status(0.1, "Export") == "idle"
+    assert status(0.101, "Import") == "import" && status(0.25, "Export") == "export"
+}
+
 check("forecast off: no forecast events") {
     app.runtimeMap("forecast")["1"] = app.parseForecast(forecastAnswer.result, "Europe/Amsterdam")
     assert app.forecastEvents("1", captured, 7.131) == []

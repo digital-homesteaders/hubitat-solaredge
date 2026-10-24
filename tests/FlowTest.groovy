@@ -952,6 +952,7 @@ check("solar forecast: hourly from Forecast.Solar, on the inverter and its summa
     FakeDevice inv = child("inverter")
     assert inv.current.forecastToday == null, "off by default"
     app.settings.forecastEnable = true
+    app.settings.forecastSource = "forecastsolar"
     app.updated(); hub.settle()
     assert app.callsNamed("runEvery1Hour").any { it[1] == "forecastRefresh" }
     assert app.callsNamed("runIn").any { it[2] == "forecastRefresh" }
@@ -987,10 +988,10 @@ check("solar forecast: hourly from Forecast.Solar, on the inverter and its summa
     // A failure: one warning, and it comes back.
     override = { call -> call[2].uri == "https://api.forecast.solar" ? new FakeResp(status: 429, data: JsonOutput.toJson([message: [text: "Rate limit for API calls reached."]])) : null }
     2.times { app.forecastRefresh(); serve() }
-    assert app.log.at("warn").count { it.contains("solar forecast for site ${SITE} failed: Rate limit") } == 1
+    assert app.log.at("warn").count { it.contains("Forecast.Solar forecast for site ${SITE} failed: Rate limit") } == 1
     override = { call -> call[2].uri == "https://api.forecast.solar" ? ok(answer) : null }
     app.forecastRefresh(); serve()
-    assert app.log.at("info").any { it.contains("solar forecast for site ${SITE} works again") }
+    assert app.log.at("info").any { it.contains("Forecast.Solar forecast for site ${SITE} works again") }
     // Tilt 0 (flat roof) is sent as 0, not the default.
     app.settings.forecastTilt = 0
     app.forecastRefresh()
@@ -1009,6 +1010,176 @@ check("solar forecast: hourly from Forecast.Solar, on the inverter and its summa
     assert app.runtimeMap("forecast").isEmpty()
     assert inv.current.forecastToday == null && inv.current.actualVsForecast == null
     assert !inv.current.summary.contains("forecast")
+}
+
+check("solar forecast for east and west faces: one request each, added up once both answer") {
+    fresh()
+    Map answer = new JsonSlurper().parse(new File(root, "tests/fixtures/forecast-solar.json"))
+    override = { call -> call[2].uri == "https://api.forecast.solar" ? ok(answer) : null }
+    install()
+    FakeDevice inv = child("inverter")
+    app.settings.forecastEnable = true
+    app.settings.forecastSource = "forecastsolar"
+    app.settings.forecastFaces = "2"
+    app.settings.forecastBearing = 90
+    app.settings.forecastBearing2 = 270
+    app.settings.forecastPanels1 = 12
+    app.settings.forecastPanels2 = 8
+    app.updated(); hub.settle()
+    app.forecastRefresh(); hub.settle()
+    List fc = serve().findAll { it[2].uri == "https://api.forecast.solar" }
+    // 8 kWp shared 12:8 between the faces
+    assert fc*.getAt(2)*.path == ["/estimate/52.37/4.89/30/-90/4.8", "/estimate/52.37/4.89/30/90/3.2"]
+    assert inv.current.forecastToday == 68.27 && inv.current.forecastPower == 9970, "both faces' answers added up"
+    // One face failing keeps the last whole forecast, and is warned about by face.
+    int seen = 0
+    override = { call -> call[2].uri == "https://api.forecast.solar" ? (seen++ == 0 ? ok(answer) : new FakeResp(status: 500, data: "{}")) : null }
+    app.forecastRefresh(); serve()
+    assert inv.current.forecastToday == 68.27
+    assert app.log.at("warn").count { it.contains("Forecast.Solar forecast for site ${SITE}, roof face 2 failed") } == 1
+    // A round's late answer doesn't mix with the next round's.
+    override = null
+    app.forecastRefresh()
+    List first = app.callsNamed("asynchttpGet").takeRight(2)
+    hub.clock += 1000L
+    app.forecastRefresh()
+    app.forecastDone(ok(answer), first[0][3])
+    assert !app.runtimeMap("forecastParts")[SITE].containsKey(1)
+}
+
+check("solar forecast from Open-Meteo by default, Forecast.Solar standing in while it fails") {
+    fresh()
+    Map om = new JsonSlurper().parse(new File(root, "tests/fixtures/open-meteo.json"))
+    Map fs = new JsonSlurper().parse(new File(root, "tests/fixtures/forecast-solar.json"))
+    boolean omDown = false
+    override = { call ->
+        if (call[2].uri == "https://api.open-meteo.com") return omDown ? new FakeResp(status: 400, data: JsonOutput.toJson([error: true, reason: "Upstream down"])) : ok(om)
+        return call[2].uri == "https://api.forecast.solar" ? ok(fs) : null
+    }
+    install()
+    FakeDevice inv = child("inverter")
+    app.settings.forecastEnable = true
+    app.updated(); hub.settle()
+    app.forecastRefresh(); hub.settle()
+    List calls = serve().findAll { it[2].uri in ["https://api.open-meteo.com", "https://api.forecast.solar"] }
+    assert calls.size() == 1 && calls[0][2].uri == "https://api.open-meteo.com" && calls[0][2].path == "/v1/forecast"
+    assert calls[0][2].query.subMap(["latitude", "longitude", "tilt", "azimuth", "timezone"]) ==
+        [latitude: "52.37", longitude: "4.89", tilt: "30", azimuth: "0", timezone: "Europe/Amsterdam"]
+    assert inv.current.forecastToday == 30.24 && inv.current.forecastPower > 0
+    // Down: the last forecast stays for two hours, the third hour Forecast.Solar stands in.
+    omDown = true
+    2.times { hub.clock += 3600000L; app.forecastRefresh(); serve() }
+    assert inv.current.forecastToday == 30.24
+    assert app.log.at("warn").count { it.contains("Open-Meteo forecast for site ${SITE} failed: Upstream down") } == 1
+    hub.clock += 3600000L; app.forecastRefresh(); serve()
+    assert app.log.at("info").any { it.contains("using Forecast.Solar for site ${SITE}'s forecast while Open-Meteo fails") }
+    assert inv.current.forecastToday == 34.14 && app.runtimeMap("forecast")[SITE].source == "forecastsolar"
+    // Open-Meteo is still asked first every hour, and takes over once it answers.
+    omDown = false
+    hub.clock += 3600000L; app.forecastRefresh()
+    calls = serve().findAll { it[2].uri in ["https://api.open-meteo.com", "https://api.forecast.solar"] }
+    assert calls*.getAt(2)*.uri == ["https://api.open-meteo.com"]
+    assert inv.current.forecastToday == 30.24
+    assert app.log.at("info").any { it.contains("Open-Meteo forecast for site ${SITE} is used again") }
+    // Without any forecast yet, the other source is asked right away, and keeps being asked every hour.
+    app.runtimeMap("forecast").clear()
+    omDown = true
+    app.forecastRefresh(); serve()
+    assert inv.current.forecastToday == 34.14
+    hub.clock += 3600000L; app.forecastRefresh()
+    calls = serve().findAll { it[2].uri in ["https://api.open-meteo.com", "https://api.forecast.solar"] }
+    assert calls*.getAt(2)*.uri == ["https://api.open-meteo.com", "https://api.forecast.solar"]
+    assert app.runtimeMap("forecast")[SITE].fetchedAt == hub.clock
+    assert app.log.at("info").count { it.contains("using Forecast.Solar for site ${SITE}'s forecast while Open-Meteo fails") } == 2, "once per switch"
+    // Back early: the switch back is logged too.
+    omDown = false
+    hub.clock += 3600000L; app.forecastRefresh(); serve()
+    assert app.log.at("info").count { it.contains("Open-Meteo forecast for site ${SITE} is used again") } == 2
+}
+
+check("forecast fallback counts hours, not rounds, and starts over when the source setting changes") {
+    fresh()
+    Map om = new JsonSlurper().parse(new File(root, "tests/fixtures/open-meteo.json"))
+    Map fs = new JsonSlurper().parse(new File(root, "tests/fixtures/forecast-solar.json"))
+    boolean omDown = false, fsDown = false
+    Closure down = { new FakeResp(status: 500, data: "{}") }
+    override = { call ->
+        if (call[2].uri == "https://api.open-meteo.com") return omDown ? down() : ok(om)
+        return call[2].uri == "https://api.forecast.solar" ? (fsDown ? down() : ok(fs)) : null
+    }
+    install()
+    app.settings.forecastEnable = true
+    app.updated(); hub.settle()
+    app.forecastRefresh(); serve()
+    // Saving the settings three times in a few minutes while Open-Meteo is down: no stand-in yet.
+    omDown = true
+    3.times { hub.clock += 60000L; app.forecastRefresh(); serve() }
+    assert !httpCalls().any { it[2].uri == "https://api.forecast.solar" }
+    // Two hours of failing make it stand in; then Forecast.Solar is chosen, which starts over.
+    2.times { hub.clock += 3600000L; app.forecastRefresh(); serve() }
+    assert app.runtimeMap("forecast")[SITE].source == "forecastsolar"
+    app.settings.forecastSource = "forecastsolar"
+    fsDown = true
+    int before = httpCalls().count { it[2].uri == "https://api.open-meteo.com" }
+    hub.clock += 3600000L; app.forecastRefresh(); serve()
+    assert httpCalls().count { it[2].uri == "https://api.open-meteo.com" } == before, "one failure of the newly chosen source isn't two hours"
+    fsDown = false
+    hub.clock += 3600000L; app.forecastRefresh(); serve()
+    assert !app.log.at("info").any { it.contains("Forecast.Solar forecast for site ${SITE} is used again") }, "it was never dropped"
+}
+
+check("forecast: an answer without a whole day is a failure, not an empty forecast") {
+    fresh()
+    Map om = new JsonSlurper().parse(new File(root, "tests/fixtures/open-meteo.json"))
+    Map gap = [minutely_15: [time: om.minutely_15.time, global_tilted_irradiance_instant: om.minutely_15.time.collect { null }]]
+    boolean gapped = false
+    override = { call -> call[2].uri == "https://api.open-meteo.com" ? ok(gapped ? gap : om) : (call[2].uri == "https://api.forecast.solar" ? new FakeResp(status: 500, data: "{}") : null) }
+    install()
+    FakeDevice inv = child("inverter")
+    app.settings.forecastEnable = true
+    app.updated(); hub.settle()
+    app.forecastRefresh(); serve()
+    gapped = true
+    hub.clock += 3600000L; app.forecastRefresh(); serve()
+    assert app.runtimeMap("forecast")[SITE].days["2026-10-15"] > 30000 && inv.current.forecastToday == 30.24
+    assert app.log.at("warn").any { it.contains("Open-Meteo forecast for site ${SITE} failed: no whole day in the answer") }
+    assert app.runtimeMap("forecastFails")[SITE]
+}
+
+check("forecast: a face's failure is forgotten once that face is no longer asked") {
+    fresh()
+    Map om = new JsonSlurper().parse(new File(root, "tests/fixtures/open-meteo.json"))
+    override = { call -> call[2].uri == "https://api.open-meteo.com" ? (call[2].query.azimuth == "90" ? new FakeResp(status: 500, data: "{}") : ok(om)) : null }
+    install()
+    app.settings.forecastEnable = true
+    app.settings.forecastFaces = "2"
+    app.settings.forecastBearing2 = 270
+    app.updated(); hub.settle()
+    app.forecastRefresh(); serve()
+    assert app.runtimeMap("failing").containsKey("forecast:openmeteo:${SITE}:2".toString())
+    app.settings.forecastFaces = "1"
+    app.forecastRefresh(); serve()
+    assert !app.runtimeMap("failing").keySet().any { it.startsWith("forecast:openmeteo:${SITE}:") }
+}
+
+check("forecast learning on the energy ticks, kept in state") {
+    fresh()
+    Map om = new JsonSlurper().parse(new File(root, "tests/fixtures/open-meteo.json"))
+    override = { call -> call[2].uri == "https://api.open-meteo.com" ? ok(om) : null }
+    install()
+    app.settings.forecastEnable = true
+    app.updated(); hub.settle()
+    app.forecastRefresh(); serve()
+    // The fixture's energyToday is 7.131 kWh, which a tick after sunset and one after midnight compare to 30.24.
+    hub.clock = app.parseIso("2026-10-15T19:00:00+02:00") as long
+    app.energyTick(); hub.settle(); serve()
+    assert app.state.forecastDays[SITE].day == "2026-10-15"
+    hub.clock = app.parseIso("2026-10-16T00:05:00+02:00") as long
+    app.energyTick(); hub.settle(); serve()
+    // 7.131 / 30.24 a third of the way from x1
+    def factor = app.state.forecastLearned[SITE].openmeteo.factor
+    assert factor > 0.74 && factor < 0.75
+    assert app.log.at("info").any { it.contains("site ${SITE} made 7.1 kWh on 2026-10-15, Open-Meteo forecast 30.2 kWh: forecasts now x${factor}") }
 }
 
 check("a rejected login is one warning, not one per request") {
