@@ -1,12 +1,12 @@
 {
   "packageName": "SolarEdge Connect",
   "author": "Digital Homesteaders",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minimumHEVersion": "2.3.0",
-  "dateReleased": "2026-10-17",
+  "dateReleased": "2026-10-23",
   "documentationLink": "https://github.com/digital-homesteaders/hubitat-solaredge#readme",
   "licenseFile": "https://raw.githubusercontent.com/digital-homesteaders/hubitat-solaredge/main/LICENSE",
-  "releaseNotes": "First release: SolarEdge inverters, meters, batteries, EV chargers and load controllers through the mySolarEdge cloud. Port of com.solaredge 2.0.0 for Homey by Robin de Gruijter.",
+  "releaseNotes": "0.2.0: Logs in with SolarEdge's new OAuth flow (the old login answers HTTP 410). Solar forecast (today, tomorrow, power now, actual vs forecast) from Open-Meteo by default or Forecast.Solar, for up to 3 roof faces, with fallback between the two and a correction learned from your production; existing forecast users move to Open-Meteo unless Forecast.Solar is chosen. gridStatus is idle within 100 W of 0, so a battery no longer makes it flip every minute. Battery charged/discharged worked out from power; EV devices polled only while charging; warnings for stale or failing answers and a raw-data button; summary line with units on every device.",
   "apps": [
     {
       "id": "753692ae-ef16-40a8-a573-aac84f129b91",
