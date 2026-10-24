@@ -413,6 +413,12 @@ check("forecast: an actual of 0 counts as 0 %") {
     assert forecastAt(captured, 0).actualVsForecast == 0
 }
 
+check("meter: grid power within 100 W either way is idle (a battery keeps it near 0 W)") {
+    Closure status = { def w, String dir -> evs(app.meterEvents([grid: [currentPower: w, status: dir, isActive: true]])).gridStatus }
+    assert status(0.04, "Import") == "idle" && status(0.1, "Export") == "idle"
+    assert status(0.101, "Import") == "import" && status(0.25, "Export") == "export"
+}
+
 check("forecast off: no forecast events") {
     app.runtimeMap("forecast")["1"] = app.parseForecast(forecastAnswer.result, "Europe/Amsterdam")
     assert app.forecastEvents("1", captured, 7.131) == []

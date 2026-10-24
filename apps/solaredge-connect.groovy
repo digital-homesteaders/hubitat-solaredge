@@ -82,6 +82,8 @@ preferences {
 @Field static final int DEFAULT_BEARING = 180
 // The location sent is rounded to this many decimals (about 1 km).
 @Field static final int FORECAST_DECIMALS = 2
+// Grid power within this many watts either way is idle: a battery holds the grid near 0 W, a few watts either side.
+@Field static final int GRID_IDLE_W = 100
 // A devices list SolarEdge last updated longer ago than this counts as stale.
 @Field static final long STALE_DATA_MS = 10 * 60 * 1000L
 // Hubitat log lines are kept short: raw answers are logged in pieces of this size.
@@ -1742,7 +1744,7 @@ List meterEvents(Map pf, Map x = [:]) {
         if (grid != null) {
             out << ev("power", grid, "W")
             out << ev("gridPower", grid, "W")
-            out << ev("gridStatus", grid > 0 ? "import" : grid < 0 ? "export" : "idle")
+            out << ev("gridStatus", grid > GRID_IDLE_W ? "import" : grid < -GRID_IDLE_W ? "export" : "idle")
         }
         if (pf.consumption) out << ev("loadPower", watts(pf.consumption.currentPower) ?: 0, "W")
         if (pf.solarProduction) out << ev("solarPower", watts(pf.solarProduction.currentPower) ?: 0, "W")

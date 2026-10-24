@@ -191,7 +191,7 @@ no account.
 | Hubitat | SolarEdge |
 | --- | --- |
 | PowerMeter `power`, `gridPower` | grid: import positive, export negative |
-| `gridStatus` | import, export, idle |
+| `gridStatus` | import, export, or idle while grid power is within 100 W either way (a battery keeps it near 0 W) |
 | `solarPower`, `loadPower`, `batteryPower` | the site's power split: production, consumption, battery (charging positive) |
 | EnergyMeter `energy`, `energyImported`; `energyExported` | lifetime grid import and export, the sum of every year since install. They appear once all past years are in. |
 | `energyImportedYear`, `energyExportedYear` | this year |
