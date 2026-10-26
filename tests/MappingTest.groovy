@@ -523,6 +523,7 @@ check("forecast curves: the first and last points are the curve's own values, ou
     assert app.interpolate(pts, 1000L, -1d, -2d) == 5d && app.interpolate(pts, 3000L, -1d, -2d) == 7d
     assert app.interpolate(pts, 999L, -1d, -2d) == -1d && app.interpolate(pts, 3001L, -1d, -2d) == -2d
     assert app.interpolate(pts, 1500L, -1d, -2d) == 10d
+    assert app.interpolate([[1000L, 5d]], 1000L, -1d, -2d) == 5d, "a one-point curve's own value on its point"
 }
 
 check("meter: grid power within 100 W either way is idle (a battery keeps it near 0 W)") {

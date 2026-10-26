@@ -899,8 +899,10 @@ def tick() {
         logDebug "Tick left to the energy tick due in ${untilEnergy.intdiv(1000)} s"
         return
     }
-    // The forecast lives in memory: after a hub restart or code save, ask again.
-    if (settings.forecastEnable && runtimeMap("forecast").isEmpty() && now() - ((rt.forecastAskedAt ?: 0L) as long) > 10 * 60000L) {
+    // The forecast lives in memory: after a hub restart or code save, ask again. Not while
+    // the sources fail (forecastFails): the hourly round and its stand-in do that.
+    if (settings.forecastEnable && runtimeMap("forecast").isEmpty() && runtimeMap("forecastFails").isEmpty() &&
+        now() - ((rt.forecastAskedAt ?: 0L) as long) > 10 * 60000L) {
         rt.forecastAskedAt = now()
         runIn(1, "forecastRefresh")
     }
@@ -1227,8 +1229,8 @@ private void forecastRound(String siteId, String source) {
     long round = now()
     runtimeMap("forecastParts")[siteId] = new ConcurrentHashMap([round: round, source: source])
     // Failures of faces no longer asked (the number of faces changed) would never be logged as working again.
-    String base = "forecast:${source}:${siteId}".toString()
-    List keys = faces.size() > 1 ? (1..faces.size()).collect { "${base}:${it}".toString() } : [base]
+    String base = forecastKey(source, siteId, 1, 1)
+    List keys = (1..faces.size()).collect { forecastKey(source, siteId, it, faces.size()) }
     runtimeMap("failing").keySet().findAll { (it == base || it.startsWith(base + ":")) && !(it in keys) }.each { runtimeMap("failing").remove(it) }
     faces.eachWithIndex { Map f, int i ->
         double faceKwp = kwp * (f.share as double)
@@ -1238,6 +1240,11 @@ private void forecastRound(String siteId, String source) {
         asynchttpGet("forecastDone", req + [headers: [Accept: "application/json"], contentType: "application/json", timeout: REQUEST_TIMEOUT],
             [siteId: siteId, face: i + 1, faces: faces.size(), round: round, source: source, kwp: faceKwp, tz: tz])
     }
+}
+
+/** The failure key (noteFailure) of one forecast request: per source and site, and per roof face when there are several. */
+private String forecastKey(String source, String siteId, int face, int faces) {
+    "forecast:${source}:${siteId}${faces > 1 ? ':' + face : ''}".toString()
 }
 
 /** Forecast.Solar's /estimate/lat/lon/tilt/azimuth/kWp, the location rounded to about 1 km, the azimuth counted from south. */
@@ -1265,11 +1272,11 @@ def forecastDone(resp, Map data) {
     String source = (data.source ?: "forecastsolar") as String
     int status = statusOf(resp)
     def json = parseJsonText(bodyOf(resp))
-    String key = "forecast:${source}:${siteId}${faces > 1 ? ':' + face : ''}".toString()
+    String key = forecastKey(source, siteId, face, faces)
     String what = "${FORECAST_SOURCES[source]} forecast for site ${siteId}${faces > 1 ? ', roof face ' + face : ''}"
     Map parts = runtimeMap("forecastParts")[siteId]
     // A newer round started meanwhile: its own answers count.
-    boolean current = data.round == null || parts?.round == data.round
+    boolean current = data.round == null || (parts?.round == data.round && parts?.source == source)
     Map part = null
     if (status == 200 && json instanceof Map) {
         String tz = (data.tz ?: location?.timeZone?.ID) as String
@@ -1333,16 +1340,12 @@ private void forecastFailed(String siteId, String source) {
 Map parseOpenMeteo(Map m, double kwp, String tz) {
     List times = m.time instanceof List ? m.time : []
     List gti = m.global_tilted_irradiance_instant instanceof List ? m.global_tilted_irradiance_instant : []
-    Map watts = [:]
+    List points = []
     times.eachWithIndex { def at, int i ->
         def v = i < gti.size() ? gti[i] : null
-        if (!(at instanceof Number) || !(v instanceof Number)) return
-        long ms = (at as long) * 1000L
-        String day = dayIn(ms, tz)
-        if (!watts[day]) watts[day] = []
-        watts[day] << [ms, Math.max(0d, v as double) * kwp * OPEN_METEO_RATIO]
+        if ((at instanceof Number) && (v instanceof Number)) points << [(at as long) * 1000L, Math.max(0d, v as double) * kwp * OPEN_METEO_RATIO]
     }
-    watts.each { day, pts -> pts.sort { it[0] } }
+    Map watts = curvesByDay(points, tz)
     Map days = [:]
     // A day counts once the answer covers it to the last quarter hour (the last day can stop short).
     watts.each { day, pts -> if (pts.size() >= 90) days[day] = integrate(pts, Long.MAX_VALUE) }
@@ -1364,19 +1367,27 @@ Map parseForecast(Map result, String tz) {
         if (v != null && k.contains("T")) return v
         try { return local.parse(k).time } catch (e) { return null }
     }
-    Map watts = [:]
+    List points = []
     (result.watts ?: [:]).each { k, v ->
         Long at = ms(k as String)
-        if (at != null && v instanceof Number) {
-            String day = dayIn(at, tz)
-            if (!watts[day]) watts[day] = []
-            watts[day] << [at, v as double]
-        }
+        if (at != null && v instanceof Number) points << [at, v as double]
     }
-    watts.each { day, pts -> pts.sort { it[0] } }
+    Map watts = curvesByDay(points, tz)
     Map days = [:]
     (result.watt_hours_day ?: [:]).each { k, v -> if (v instanceof Number) days[(k as String).take(10)] = v as double }
     return [tz: tz, days: days, watts: watts]
+}
+
+/** [ms, W] points as a power curve per day ("yyyy-MM-dd" in tz), each day's in time order. */
+private Map curvesByDay(List pts, String tz) {
+    Map watts = [:]
+    pts.each { p ->
+        String day = dayIn(p[0] as long, tz)
+        if (!watts[day]) watts[day] = []
+        watts[day] << p
+    }
+    watts.each { day, c -> c.sort { it[0] } }
+    return watts
 }
 
 /**
@@ -1521,6 +1532,7 @@ private double interpolate(List pts, long t, double before, double after) {
     if (!pts) return before
     if (t < (pts[0][0] as long)) return before
     if (t > (pts[-1][0] as long)) return after
+    if (pts.size() == 1) return pts[0][1] as double
     for (int i = 1; i < pts.size(); i++) {
         long t1 = pts[i][0] as long
         if (t <= t1) {

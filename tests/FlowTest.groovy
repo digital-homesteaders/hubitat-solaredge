@@ -1004,6 +1004,12 @@ check("solar forecast: hourly from Forecast.Solar, on the inverter and its summa
     assert app.callsNamed("runIn").count { it[2] == "forecastRefresh" && (it[4] as long) == hub.clock } == 1
     fastTick()
     assert app.callsNamed("runIn").count { it[2] == "forecastRefresh" && (it[4] as long) >= hub.clock - 60000L } == 1
+    // Not while the sources fail: the hourly round and its stand-in retry, not every poll.
+    app.runtimeMap("forecastFails")[SITE] = [source: "forecastsolar", since: hub.clock, standIn: true]
+    app.runtime().forecastAskedAt = hub.clock - 11 * 60000L
+    fastTick()
+    assert app.callsNamed("runIn").count { it[2] == "forecastRefresh" && (it[4] as long) == hub.clock } == 0, "no re-ask while failing"
+    app.runtimeMap("forecastFails").clear()
     // Turned off: the inverter drops the forecast values and its summary no longer shows them.
     app.settings.forecastEnable = false
     app.updated(); hub.settle()
